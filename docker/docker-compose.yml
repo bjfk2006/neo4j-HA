@@ -1,0 +1,178 @@
+# Neo4j HA - Docker Compose
+#
+# 基于用户现有生产环境 (neo4j:2026.02.3 + APOC + GDS) 扩展为主备高可用。
+# Redis 复用平台已有实例，不在本 Compose 中部署。
+# 开发/测试环境单机部署。生产环境建议主备分机部署。
+#
+# 启动: docker compose --env-file .env up -d
+# 停止: docker compose down
+# 查看: docker compose ps
+
+services:
+  # ========== Neo4j Primary ==========
+  neo4j-primary:
+    image: neo4j:2026.02.3
+    container_name: neo4j-primary
+    restart: always
+    ports:
+      - "7474:7474"   # HTTP UI
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_dbms_security_auth__max__failed__attempts: "0"
+      # JVM 内存
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-4G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-4G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-2G}
+      # 插件：apoc-extended 用于删除事件捕获
+      NEO4J_PLUGINS: '["apoc", "apoc-extended", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+      # APOC Trigger — CDC 变更捕获的核心依赖
+      NEO4J_apoc_trigger_enabled: "true"
+      NEO4J_apoc_trigger_refresh: "1000"
+      # 导入导出
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      # 事务日志保留（用于 CDC 追赶）
+      NEO4J_db_tx__log_rotation_retention__policy: "7 days"
+      TZ: ${TZ:-Asia/Singapore}
+    volumes:
+      - neo4j-primary-data:/data
+      - neo4j-primary-logs:/logs
+      - ./import:/import
+      - ./plugins:/plugins
+    networks:
+      - neo4j-ha
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ========== Neo4j Standby ==========
+  neo4j-standby:
+    image: neo4j:2026.02.3
+    container_name: neo4j-standby
+    restart: always
+    ports:
+      - "7475:7474"   # HTTP UI (offset +1)
+      - "7688:7687"   # Bolt (offset +1)
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_dbms_security_auth__max__failed__attempts: "0"
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-4G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-4G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-2G}
+      NEO4J_PLUGINS: '["apoc", "apoc-extended", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+      # Trigger 引擎开启（但不预装 trigger，提升为 Primary 时由 HA Agent 安装）
+      NEO4J_apoc_trigger_enabled: "true"
+      NEO4J_apoc_trigger_refresh: "1000"
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_db_tx__log_rotation_retention__policy: "7 days"
+      TZ: ${TZ:-Asia/Singapore}
+    volumes:
+      - neo4j-standby-data:/data
+      - neo4j-standby-logs:/logs
+      - ./import:/import:ro
+      - ./plugins:/plugins
+    networks:
+      - neo4j-ha
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ========== Redis ==========
+  # Redis 复用平台已有实例，不在本 Compose 中部署。
+  # HA Agent 通过 ha-agent.yml 中的 redis.standalone 配置连接外部 Redis。
+  # 需在 .env 中设置 REDIS_HOST、REDIS_PORT、REDIS_PASSWORD。
+
+  # ========== HAProxy-1 (多活实例 1) ==========
+  # 多个 HAProxy 实例使用相同配置独立运行，客户端配置多地址 fallback。
+  # HA Agent 通过各实例的 admin socket 统一管理路由状态。
+  haproxy-1:
+    image: haproxy:2.8-alpine
+    container_name: haproxy-1
+    restart: always
+    ports:
+      - "17687:7687"    # Write VIP
+      - "17688:7688"    # Read VIP
+      - "8404:8404"     # Stats
+    volumes:
+      - ../config/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - haproxy-1-socket:/var/run/haproxy
+    networks:
+      - neo4j-ha
+    depends_on:
+      neo4j-primary:
+        condition: service_healthy
+      neo4j-standby:
+        condition: service_healthy
+
+  # ========== HAProxy-2 (多活实例 2) ==========
+  haproxy-2:
+    image: haproxy:2.8-alpine
+    container_name: haproxy-2
+    restart: always
+    ports:
+      - "27687:7687"    # Write VIP (offset)
+      - "27688:7688"    # Read VIP (offset)
+      - "8405:8404"     # Stats (offset)
+    volumes:
+      - ../config/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - haproxy-2-socket:/var/run/haproxy
+    networks:
+      - neo4j-ha
+    depends_on:
+      neo4j-primary:
+        condition: service_healthy
+      neo4j-standby:
+        condition: service_healthy
+
+  # ========== HA Agent (集中式单实例) ==========
+  # 管理整个集群：CDC采集、数据同步、健康检查、Failover编排、HAProxy路由。
+  # 挂载所有 HAProxy 实例的 admin socket 卷，统一管理路由状态。
+  # 取消注释并 build 后启用。需先完成 Java 代码实现。
+  # ha-agent:
+  #   build: ./ha-agent
+  #   container_name: ha-agent
+  #   restart: always
+  #   environment:
+  #     NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+  #     REDIS_HOST: ${REDIS_HOST:-redis}
+  #     REDIS_PORT: ${REDIS_PORT:-6379}
+  #     REDIS_PASSWORD: ${REDIS_PASSWORD}
+  #     ADMIN_TOKEN: ${ADMIN_TOKEN}
+  #   ports:
+  #     - "8080:8080"    # Admin API + Health
+  #     - "9090:9090"    # Prometheus metrics
+  #   volumes:
+  #     - ../config/agent/ha-agent.yml:/app/config/ha-agent.yml:ro
+  #     - haproxy-1-socket:/var/run/haproxy-1
+  #     - haproxy-2-socket:/var/run/haproxy-2
+  #     - ha-agent-buffer:/var/lib/neo4j-ha/buffer
+  #   networks:
+  #     - neo4j-ha
+  #   depends_on:
+  #     neo4j-primary:
+  #       condition: service_healthy
+  #     neo4j-standby:
+  #       condition: service_healthy
+
+volumes:
+  neo4j-primary-data:
+  neo4j-primary-logs:
+  neo4j-standby-data:
+  neo4j-standby-logs:
+  haproxy-1-socket:
+  haproxy-2-socket:
+  # ha-agent-buffer:
+
+networks:
+  neo4j-ha:
+    driver: bridge

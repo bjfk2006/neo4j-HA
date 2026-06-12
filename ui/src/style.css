@@ -1,0 +1,199 @@
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  background: #f5f7fa;
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei',
+               'Helvetica Neue', Arial, sans-serif;
+  color: #303133;
+  font-size: 14px;
+}
+
+/* =========== 3-column shell =========== */
+.layout-shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.layout-sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: #001529;
+  color: #cbd5e1;
+  display: flex;
+  flex-direction: column;
+}
+
+.layout-main {
+  flex: 1;
+  overflow: auto;
+  padding: 20px 24px;
+  min-width: 0;
+}
+
+.layout-aside {
+  width: 400px;
+  flex-shrink: 0;
+  background: #fff;
+  border-left: 1px solid #ebeef5;
+  overflow: auto;
+  padding: 16px;
+}
+
+/* =========== Sidebar internals =========== */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 20px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.brand-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: 0.5px;
+}
+
+.user-block {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 20px 14px 20px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.user-meta { display: flex; flex-direction: column; gap: 4px; }
+.user-name { color: #fff; font-size: 14px; font-weight: 500; }
+
+.layout-menu {
+  flex: 1;
+  border-right: none !important;
+  padding-top: 8px;
+}
+.layout-menu .el-menu-item {
+  height: 44px;
+  line-height: 44px;
+  font-size: 14px;
+}
+.layout-menu .el-menu-item.is-active {
+  background-color: #1890ff !important;
+  color: #fff !important;
+}
+
+.sidebar-footer {
+  padding: 12px 16px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+/* =========== Right aside (status overview) =========== */
+.aside-section {
+  margin-bottom: 22px;
+}
+.aside-section:last-child { margin-bottom: 0; }
+
+.aside-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #909399;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  margin: 0 0 10px 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.aside-section-title .badge {
+  background: #f0f2f5;
+  color: #606266;
+  padding: 1px 8px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.node-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.node-row + .node-row { border-top: 1px solid #f0f2f5; }
+.node-row .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  flex-shrink: 0;
+}
+.node-row .dot.ok      { background: #67C23A; }
+.node-row .dot.warn    { background: #E6A23C; }
+.node-row .dot.danger  { background: #F56C6C; }
+.node-row .dot.muted   { background: #C0C4CC; }
+.node-row .node-name   { flex: 1; font-family: 'SF Mono', Menlo, monospace; }
+.node-row .node-role-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: #f0f2f5;
+  color: #606266;
+}
+.node-row .node-role-tag.primary { background: #ecf5ff; color: #409EFF; }
+.node-row .maint-badge {
+  margin: 0 4px 0 2px;
+  font-size: 13px;
+  cursor: help;
+}
+
+.event-row {
+  font-size: 12px;
+  padding: 8px 6px;
+  border-bottom: 1px solid #f0f2f5;
+}
+.event-row:last-child { border-bottom: none; }
+.event-row .event-ts { color: #909399; font-size: 11px; }
+.event-row .event-type { font-weight: 500; margin-top: 2px; }
+
+.spark-wrap {
+  background: #fafbfc;
+  border-radius: 4px;
+  padding: 8px;
+}
+.spark-summary {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #606266;
+  margin-bottom: 4px;
+}
+.spark-summary .big-num {
+  font-size: 18px;
+  font-weight: 600;
+  color: #303133;
+  line-height: 1;
+}
+
+/* =========== Cards / grids (shared by views) =========== */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.muted { color: #909399; font-size: 12px; }
+
+/* Page title bar inside main */
+.page-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 0 0 18px 0;
+}
+.page-title h2 { margin: 0; font-size: 18px; font-weight: 600; }
+.page-title .meta { color: #909399; font-size: 12px; }

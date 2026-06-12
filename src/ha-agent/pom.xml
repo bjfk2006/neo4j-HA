@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.neo4j.ha</groupId>
+        <artifactId>neo4j-ha-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>neo4j-ha-agent</artifactId>
+    <name>Neo4j HA - Agent</name>
+    <description>Centralized HA Agent managing the entire Neo4j cluster</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.neo4j.ha</groupId>
+            <artifactId>neo4j-ha-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.neo4j.ha</groupId>
+            <artifactId>neo4j-ha-cdc-collector</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.neo4j.ha</groupId>
+            <artifactId>neo4j-ha-sync-applier</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.neo4j.driver</groupId>
+            <artifactId>neo4j-java-driver</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.dataformat</groupId>
+            <artifactId>jackson-dataformat-yaml</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.javalin</groupId>
+            <artifactId>javalin</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>at.favre.lib</groupId>
+            <artifactId>bcrypt</artifactId>
+            <version>0.10.2</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.3.0</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>com.neo4j.ha.agent.HaAgent</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <!--
+        Optional profile that builds the Web UI as part of `mvn package`.
+        Disabled by default so the Java build works without a Node toolchain.
+        Activate with `mvn -Pwith-ui package`. The plugin installs Node + npm
+        into a sandbox, runs `npm install` and `npm run build` in ui/, and
+        Vite outputs the bundle into src/ha-agent/src/main/resources/static
+        (see ui/vite.config.js), where Javalin picks it up at runtime.
+    -->
+    <profiles>
+        <profile>
+            <id>with-ui</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>com.github.eirslett</groupId>
+                        <artifactId>frontend-maven-plugin</artifactId>
+                        <version>1.15.0</version>
+                        <configuration>
+                            <workingDirectory>${project.basedir}/../../ui</workingDirectory>
+                            <installDirectory>${project.basedir}/../../ui/.node-cache</installDirectory>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>install-node-and-npm</id>
+                                <goals><goal>install-node-and-npm</goal></goals>
+                                <configuration>
+                                    <nodeVersion>v20.12.2</nodeVersion>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>npm-install</id>
+                                <goals><goal>npm</goal></goals>
+                                <configuration>
+                                    <arguments>install --no-audit --no-fund</arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>npm-run-build</id>
+                                <goals><goal>npm</goal></goals>
+                                <configuration>
+                                    <arguments>run build</arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

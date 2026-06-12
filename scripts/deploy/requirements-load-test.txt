@@ -1,0 +1,4 @@
+# Load/switchover integration test dependencies.
+# Install with: pip install -r scripts/deploy/requirements-load-test.txt
+neo4j>=5.20.0,<6
+requests>=2.31,<3

@@ -1,0 +1,176 @@
+services:
+  neo4j-primary:
+    image: neo4j:5.26-community
+    container_name: neo4j-primary
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_dbms_security_auth__max__failed__attempts: "0"
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+      NEO4J_apoc_trigger_enabled: "true"
+      NEO4J_apoc_trigger_refresh: "1000"
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_db_tx__log_rotation_retention__policy: "7 days"
+      TZ: ${TZ:-Asia/Singapore}
+    volumes:
+      - /opt/neo4j-node1/data:/data
+      - /opt/neo4j-node1/logs:/logs
+      - /opt/neo4j-node1/import:/import
+      - /opt/neo4j-node1/plugins:/plugins
+    networks:
+      - neo4j-ha
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  neo4j-standby-1:
+    image: neo4j:5.26-community
+    container_name: neo4j-standby-1
+    restart: unless-stopped
+    ports:
+      - "7475:7474"
+      - "7688:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_dbms_security_auth__max__failed__attempts: "0"
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+      NEO4J_apoc_trigger_enabled: "true"
+      NEO4J_apoc_trigger_refresh: "1000"
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_db_tx__log_rotation_retention__policy: "7 days"
+      TZ: ${TZ:-Asia/Singapore}
+    volumes:
+      - /opt/neo4j-node2/data:/data
+      - /opt/neo4j-node2/logs:/logs
+      - /opt/neo4j-node2/import:/import
+      - /opt/neo4j-node2/plugins:/plugins
+    networks:
+      - neo4j-ha
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  neo4j-standby-2:
+    image: neo4j:5.26-community
+    container_name: neo4j-standby-2
+    restart: unless-stopped
+    ports:
+      - "7476:7474"
+      - "7689:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_dbms_security_auth__max__failed__attempts: "0"
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-2G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1G}
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+      NEO4J_apoc_trigger_enabled: "true"
+      NEO4J_apoc_trigger_refresh: "1000"
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_db_tx__log_rotation_retention__policy: "7 days"
+      TZ: ${TZ:-Asia/Singapore}
+    volumes:
+      - /opt/neo4j-node3/data:/data
+      - /opt/neo4j-node3/logs:/logs
+      - /opt/neo4j-node3/import:/import
+      - /opt/neo4j-node3/plugins:/plugins
+    networks:
+      - neo4j-ha
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  haproxy-1:
+    image: haproxy:3.2.9
+    container_name: haproxy-1
+    restart: "on-failure:5"
+    user: "0:0"
+    ports:
+      - "17687:7687"
+      - "17688:7688"
+      - "8404:8404"
+    volumes:
+      - /opt/haproxy-1/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - /opt/haproxy-1/haproxy-1-socket:/var/run/haproxy
+    networks:
+      - neo4j-ha
+    depends_on:
+      neo4j-primary:
+        condition: service_healthy
+
+  haproxy-2:
+    image: haproxy:3.2.9
+    container_name: haproxy-2
+    restart: "on-failure:5"
+    user: "0:0"
+    ports:
+      - "27687:7687"
+      - "27688:7688"
+      - "8405:8404"
+    volumes:
+      - /opt/haproxy-2/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - /opt/haproxy-2/haproxy-2-socket:/var/run/haproxy
+    networks:
+      - neo4j-ha
+    depends_on:
+      neo4j-primary:
+        condition: service_healthy
+
+  ha-agent:
+    # Pre-built image (registry or local tag). With test-compose.dev.yml merged, Compose also builds this tag from docker/ha-agent/Dockerfile.
+    image: ${HA_AGENT_IMAGE:-neo4j-ha-agent:1.0.0-SNAPSHOT}
+    container_name: ha-agent
+    restart: unless-stopped
+    working_dir: /app
+    command: >
+      java -Xms512m -Xmx1g -XX:+UseG1GC -XX:MaxGCPauseMillis=200
+      -cp "/app/ha-agent.jar:/app/lib/*"
+      com.neo4j.ha.agent.HaAgent /app/config/ha-agent.yml
+    environment:
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      REDIS_HOST: ${REDIS_HOST:-172.19.0.11}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      TZ: ${TZ:-Asia/Singapore}
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - /opt/ha-agent/ha-agent.yml:/app/config/ha-agent.yml:ro
+      - /opt/haproxy-1/haproxy-1-socket:/var/run/haproxy-1
+      - /opt/haproxy-2/haproxy-2-socket:/var/run/haproxy-2
+      - /opt/ha-agent/buffer:/var/lib/neo4j-ha/buffer
+    networks:
+      - neo4j-ha
+    depends_on:
+      neo4j-primary:
+        condition: service_healthy
+
+networks:
+  neo4j-ha:
+    driver: bridge

@@ -1,0 +1,5 @@
+# Vite build output (ui/dist) lands here. Empty placeholder so Maven creates
+# the directory in the jar. The actual UI bundle is produced by:
+#   cd ui && npm install && npm run build
+# and the frontend-maven-plugin (see src/ha-agent/pom.xml) copies dist/* here
+# during `mvn package`.

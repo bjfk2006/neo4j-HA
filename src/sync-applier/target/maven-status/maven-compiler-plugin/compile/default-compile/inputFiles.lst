@@ -1,0 +1,16 @@
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/SyncApplier.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/SyncApplierConfig.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/applier/ChangeApplier.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/applier/CypherTemplates.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/applier/IndexManager.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/applier/NodeApplier.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/applier/RelationshipApplier.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/consumer/FullSyncConsumer.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/consumer/IncrementalConsumer.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/consumer/PendingRecovery.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/fullsync/BulkImporter.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/fullsync/DatabaseCleaner.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/fullsync/FullSyncReceiver.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/validation/DuplicateDetector.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/validation/FencingTokenFilter.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/sync-applier/src/main/java/com/neo4j/ha/sync/validation/OrderValidator.java

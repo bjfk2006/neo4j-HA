@@ -1,0 +1,16 @@
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/CdcCollector.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/CdcCollectorConfig.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/capture/DeleteEventCapture.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/capture/NodeChangeCapture.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/capture/RelationshipChangeCapture.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/fullsync/FullSyncCoordinator.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/fullsync/NodeExporter.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/fullsync/RelationshipExporter.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/heal/NakedRelationshipHealer.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/polling/ChangeDetector.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/polling/CypherPollingStrategy.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/polling/PollingState.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/publish/PublishBuffer.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/publish/StreamPublishService.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/transform/ChangeEventBuilder.java
+/Users/fukai/Downloads/llm_project/git_target/neo4j-ha/src/cdc-collector/src/main/java/com/neo4j/ha/cdc/transform/DiffCalculator.java

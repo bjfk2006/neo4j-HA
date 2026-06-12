@@ -1,0 +1,146 @@
+# Neo4j HA Agent Configuration — 2-node (1 Primary + 1 Standby)
+# 对应 docker/neo4j/deploy-test.yml 的 2 节点测试环境部署。
+# 3 节点版本参见同目录 ha-agent.yml。
+# Environment variables can be referenced with the ${VAR_NAME} or ${VAR_NAME:-default} syntax.
+
+cluster:
+  nodes:
+    - id: "node-01"
+      role: "primary"
+      neo4j:
+        uri: "bolt://neo4j-primary:7687"
+        username: "neo4j"
+        password: "${NEO4J_PASSWORD}"
+        database: "neo4j"
+    - id: "node-02"
+      role: "standby"
+      neo4j:
+        uri: "bolt://neo4j-standby-1:7687"
+        username: "neo4j"
+        password: "${NEO4J_PASSWORD}"
+        database: "neo4j"
+
+  neo4j:
+    maxConnectionPoolSize: 50
+    connectionAcquisitionTimeout: 30s
+
+  haproxy:
+    instances:
+      - id: "haproxy-1"
+        adminSocket: "/var/run/haproxy-1/admin.sock"
+      - id: "haproxy-2"
+        adminSocket: "/var/run/haproxy-2/admin.sock"
+    primaryBackend: "neo4j_primary"
+    readBackend: "neo4j_all"
+    stateSyncInterval: 10s
+
+redis:
+  mode: "standalone"              # standalone | sentinel | cluster
+  standalone:
+    host: "${REDIS_HOST:-172.19.0.11}"
+    port: ${REDIS_PORT:-6379}
+  database: 0
+  timeout: 3s
+  pool:
+    maxTotal: 20
+    maxIdle: 10
+
+cdc:
+  enabled: true
+  mode: "cypher-polling"          # cypher-polling | apoc-trigger
+  poll:
+    interval: 100ms
+    batchSize: 500
+    timeout: 5s
+  timestampField: "_updated_at"
+  createdAtField: "_created_at"
+  elementIdField: "_elementId"
+  cache:
+    maxSize: 50000
+  index:
+    autoCreate: true
+    skipSystemLabels: true
+
+sync:
+  consumer:
+    group: "sync-applier"
+    batchSize: 100
+    blockTimeout: 1000ms
+  apply:
+    mode: "merge"
+    batchCommit: true
+    maxRetries: 3
+    retryDelay: 1s
+  duplicateDetector:
+    maxSize: 100000
+
+stream:
+  changes: "neo4j:cdc:neo4j:changes"
+  fullsync: "neo4j:cdc:neo4j:fullsync"
+  maxLen: 1000000
+  trimStrategy: "approximate"
+  maintenanceInterval: ""            # disabled: Redis 6.0 不支持 XTRIM MINID，升级到 6.2+ 后改回 "60s"
+  retentionSafetyWindow: "5m"
+
+fullsync:
+  batchSize: 1000
+  throttleMs: 10
+
+serviceState:
+  syncLagThreshold: 2000      # 同步延迟低于 2s 视为数据就绪
+  stableDuration: 10s         # 延迟持续稳定 10s 才切为 ONLINE
+  checkInterval: 1s           # 检查间隔
+
+failover:
+  healthCheck:
+    interval: 2s
+    timeout: 5s
+    failThreshold: 3
+    successThreshold: 2
+  fencingToken:
+    key: "neo4j:ha:fencing-token"
+  drainTimeout: 5s
+  confirmationWait: 5s
+  minInterval: 60s
+  maxAutoPerHour: 3
+
+backup:
+  maxDuration: 2h              # 备份超时自动恢复 Sync Applier
+  checkpointKey: "neo4j:ha:backup-checkpoint"
+
+registry:
+  key: "neo4j:ha:node-registry"
+  updateInterval: 2s
+
+admin:
+  port: 8080
+  auth:
+    type: "token"
+    token: "${ADMIN_TOKEN}"
+  # See ha-agent.yml for the full ui:* block + usage. UI disabled by default.
+  ui:
+    enabled: false
+    users: []
+    session:
+      ttl: "8h"
+      maxPerUser: 3
+    rateLimit:
+      maxFailuresPerMinute: 5
+      lockDuration: "10m"
+
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+    path: "/metrics"
+  logging:
+    level: "INFO"
+    format: "json"
+    file: "/var/log/neo4j-ha/agent.log"
+    maxSize: "100MB"
+    maxHistory: 30
+
+buffer:
+  dir: "/var/lib/neo4j-ha/buffer"
+  maxFileSize: "10MB"
+  maxFiles: 100

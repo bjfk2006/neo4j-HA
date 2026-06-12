@@ -1,0 +1,213 @@
+{
+  "initial_primary": "node-01",
+  "final_primary": "node-03",
+  "returned_to_initial": false,
+  "rotations_requested": 1,
+  "switchover_events": [],
+  "write_summary": {
+    "count": 2241,
+    "ok": 1990,
+    "fail": 251,
+    "error_rate": 0.11200356983489514,
+    "latency_ms": {
+      "p50": 4.42,
+      "p95": 7.78,
+      "p99": 13.88,
+      "max": 248.34
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 2241,
+        "ok": 1990,
+        "fail": 251
+      }
+    }
+  },
+  "read_summary": {
+    "count": 2402,
+    "ok": 2401,
+    "fail": 1,
+    "error_rate": 0.00041631973355537054,
+    "latency_ms": {
+      "p50": 1.93,
+      "p95": 2.72,
+      "p99": 5.6,
+      "max": 76.15
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 2401,
+        "ok": 2400,
+        "fail": 1
+      },
+      "stopping": {
+        "total": 1,
+        "ok": 1,
+        "fail": 0
+      }
+    }
+  },
+  "rel_summary": {
+    "count": 1122,
+    "ok": 618,
+    "fail": 504,
+    "error_rate": 0.44919786096256686,
+    "latency_ms": {
+      "p50": 4.73,
+      "p95": 7.9,
+      "p99": 21.4,
+      "max": 291.38
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 1122,
+        "ok": 618,
+        "fail": 504
+      }
+    }
+  },
+  "delete_summary": {
+    "count": 442,
+    "ok": 398,
+    "fail": 44,
+    "error_rate": 0.09954751131221719,
+    "latency_ms": {
+      "p50": 5.38,
+      "p95": 12.45,
+      "p99": 48.09,
+      "max": 176.0
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 442,
+        "ok": 398,
+        "fail": 44
+      }
+    }
+  },
+  "gds_summary": {
+    "count": 1,
+    "ok": 1,
+    "fail": 0,
+    "error_rate": 0.0,
+    "latency_ms": {
+      "p50": 1542.48,
+      "p95": 1542.48,
+      "p99": 1542.48,
+      "max": 1542.48
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 1,
+        "ok": 1,
+        "fail": 0
+      }
+    }
+  },
+  "expected_written_count": 1990,
+  "expected_present_count": 1622,
+  "deleted_count": 368,
+  "failed_write_count": 251,
+  "expected_rel_pairs": 618,
+  "gds_community_runs": 1,
+  "community_reference_node": "node-01",
+  "integrity_ok": false,
+  "per_node": {
+    "node-01": {
+      "ok": false,
+      "count_total": 1621,
+      "count_current_run": 1621,
+      "missing_count": 1,
+      "extra_count": 0,
+      "missing_sample": [
+        625
+      ],
+      "extra_sample": [],
+      "delete_leak_count": 0,
+      "delete_leak_sample": [],
+      "rel_count": 338,
+      "rel_missing_count": 2,
+      "rel_extra_count": 0,
+      "rel_missing_sample": [
+        [
+          308,
+          309
+        ],
+        [
+          313,
+          314
+        ]
+      ],
+      "rel_extra_sample": [],
+      "community_nodes": 518,
+      "community_distinct": 374,
+      "community_matches_reference": true,
+      "stale_count": 0,
+      "stale_writers": []
+    },
+    "node-02": {
+      "ok": false,
+      "count_total": 1621,
+      "count_current_run": 1621,
+      "missing_count": 1,
+      "extra_count": 0,
+      "missing_sample": [
+        625
+      ],
+      "extra_sample": [],
+      "delete_leak_count": 0,
+      "delete_leak_sample": [],
+      "rel_count": 338,
+      "rel_missing_count": 2,
+      "rel_extra_count": 0,
+      "rel_missing_sample": [
+        [
+          308,
+          309
+        ],
+        [
+          313,
+          314
+        ]
+      ],
+      "rel_extra_sample": [],
+      "community_nodes": 518,
+      "community_distinct": 374,
+      "community_matches_reference": true,
+      "stale_count": 0,
+      "stale_writers": []
+    },
+    "node-03": {
+      "ok": false,
+      "count_total": 1621,
+      "count_current_run": 1621,
+      "missing_count": 1,
+      "extra_count": 0,
+      "missing_sample": [
+        625
+      ],
+      "extra_sample": [],
+      "delete_leak_count": 0,
+      "delete_leak_sample": [],
+      "rel_count": 338,
+      "rel_missing_count": 2,
+      "rel_extra_count": 0,
+      "rel_missing_sample": [
+        [
+          308,
+          309
+        ],
+        [
+          313,
+          314
+        ]
+      ],
+      "rel_extra_sample": [],
+      "community_nodes": 518,
+      "community_distinct": 374,
+      "community_matches_reference": true,
+      "stale_count": 0,
+      "stale_writers": []
+    }
+  }
+}

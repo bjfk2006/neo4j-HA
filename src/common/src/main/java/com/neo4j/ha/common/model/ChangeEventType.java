@@ -1,0 +1,15 @@
+package com.neo4j.ha.common.model;
+
+public enum ChangeEventType {
+    NODE_CREATED,
+    NODE_UPDATED,
+    NODE_DELETED,
+    RELATIONSHIP_CREATED,
+    RELATIONSHIP_UPDATED,
+    RELATIONSHIP_DELETED,
+    FULL_SYNC_START,
+    FULL_SYNC_BATCH,
+    FULL_SYNC_END,
+    STEP_DOWN,
+    HEARTBEAT
+}

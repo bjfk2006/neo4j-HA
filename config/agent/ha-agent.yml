@@ -1,0 +1,178 @@
+# Neo4j HA Agent Configuration (v2.0 集中式架构)
+# 单进程管理整个集群，远程连接所有 Neo4j 节点。
+# Environment variables can be referenced with the ${VAR_NAME} or ${VAR_NAME:-default} syntax.
+
+cluster:
+  nodes:
+    - id: "node-01"
+      role: "primary"
+      neo4j:
+        uri: "bolt://neo4j-primary:7687"
+        username: "neo4j"
+        password: "${NEO4J_PASSWORD}"
+        database: "neo4j"
+    - id: "node-02"
+      role: "standby"
+      neo4j:
+        uri: "bolt://neo4j-standby-1:7687"
+        username: "neo4j"
+        password: "${NEO4J_PASSWORD}"
+        database: "neo4j"
+    - id: "node-03"
+      role: "standby"
+      neo4j:
+        uri: "bolt://neo4j-standby-2:7687"
+        username: "neo4j"
+        password: "${NEO4J_PASSWORD}"
+        database: "neo4j"
+
+  neo4j:
+    maxConnectionPoolSize: 50
+    connectionAcquisitionTimeout: 30s
+
+  haproxy:
+    instances:
+      - id: "haproxy-1"
+        adminSocket: "/var/run/haproxy-1/admin.sock"
+      - id: "haproxy-2"
+        adminSocket: "/var/run/haproxy-2/admin.sock"
+    primaryBackend: "neo4j_primary"
+    readBackend: "neo4j_all"
+    stateSyncInterval: 10s
+
+redis:
+  mode: "standalone"              # standalone | sentinel | cluster
+  standalone:
+    host: "${REDIS_HOST:-172.19.0.11}"
+    port: ${REDIS_PORT:-6379}
+  password: "${REDIS_PASSWORD}"
+  database: 0
+  timeout: 3s
+  pool:
+    maxTotal: 20
+    maxIdle: 10
+
+cdc:
+  enabled: true
+  mode: "cypher-polling"          # cypher-polling | apoc-trigger
+  poll:
+    interval: 100ms
+    batchSize: 500
+    timeout: 5s
+  timestampField: "_updated_at"
+  createdAtField: "_created_at"
+  elementIdField: "_elementId"
+  cache:
+    maxSize: 50000
+  index:
+    autoCreate: true
+    skipSystemLabels: true
+
+sync:
+  consumer:
+    group: "sync-applier"
+    batchSize: 100
+    blockTimeout: 1000ms
+  apply:
+    mode: "merge"
+    batchCommit: true
+    maxRetries: 3
+    retryDelay: 1s
+  duplicateDetector:
+    maxSize: 100000
+
+stream:
+  changes: "neo4j:cdc:neo4j:changes"
+  fullsync: "neo4j:cdc:neo4j:fullsync"
+  # MAXLEN on every XADD — last-resort bound against Redis OOM when a standby is
+  # gone for longer than the retention safety can tolerate. Sized generously
+  # (1M ≈ 10 writes/s × 27h) because the MINID maintenance task below is the
+  # primary retention control and we want MAXLEN to be reached only in
+  # catastrophic scenarios.
+  maxLen: 1000000
+  trimStrategy: "approximate"
+  # Consumer-aware retention (BUG-038). Periodically XTRIM MINID using a cutoff
+  # strictly older than any consumer group's lastDeliveredId / PEL minimum, so
+  # trimming NEVER removes a message a standby still needs. Set
+  # maintenanceInterval to blank/null to disable and rely solely on MAXLEN.
+  maintenanceInterval: "60s"
+  # Additional safety margin subtracted from the oldest-needed position before
+  # trimming. Absorbs transient lag between the maintenance scan and trim.
+  retentionSafetyWindow: "5m"
+
+fullsync:
+  batchSize: 1000
+  throttleMs: 10
+
+serviceState:
+  syncLagThreshold: 2000      # 同步延迟低于 2s 视为数据就绪
+  stableDuration: 10s         # 延迟持续稳定 10s 才切为 ONLINE
+  checkInterval: 1s           # 检查间隔
+
+failover:
+  healthCheck:
+    interval: 2s
+    timeout: 5s
+    failThreshold: 3
+    successThreshold: 2
+  fencingToken:
+    key: "neo4j:ha:fencing-token"
+  drainTimeout: 5s
+  confirmationWait: 5s
+  minInterval: 60s
+  maxAutoPerHour: 3
+
+backup:
+  maxDuration: 2h              # 备份超时自动恢复 Sync Applier
+  checkpointKey: "neo4j:ha:backup-checkpoint"
+
+registry:
+  key: "neo4j:ha:node-registry"
+  updateInterval: 2s
+
+admin:
+  port: 8080
+  auth:
+    type: "token"
+    token: "${ADMIN_TOKEN}"
+  # Optional Web UI. When ui.enabled is false (or this block is omitted), the
+  # admin HTTP server only serves the legacy X-Admin-Token / Authorization:
+  # Bearer REST API — fully backward-compatible with existing curl scripts.
+  #
+  # To enable:
+  #   1. Generate a bcrypt hash for each user:
+  #        java -cp ha-agent.jar com.neo4j.ha.agent.http.auth.BcryptHashCli '<plain>'
+  #   2. Paste the hash below; role is 'admin' (full write) or 'viewer' (read-only)
+  #   3. Set ui.enabled: true and restart the agent
+  ui:
+    enabled: false
+    users: []
+      # - username: "admin"
+      #   passwordHash: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+      #   role: "admin"
+      # - username: "viewer"
+      #   passwordHash: "$2a$10$..."
+      #   role: "viewer"
+    session:
+      ttl: "8h"
+      maxPerUser: 3
+    rateLimit:
+      maxFailuresPerMinute: 5
+      lockDuration: "10m"
+
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+    path: "/metrics"
+  logging:
+    level: "INFO"
+    format: "json"
+    file: "/var/log/neo4j-ha/agent.log"
+    maxSize: "100MB"
+    maxHistory: 30
+
+buffer:
+  dir: "/var/lib/neo4j-ha/buffer"
+  maxFileSize: "10MB"
+  maxFiles: 100

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Neo4j HA Agent</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; color: #333; }
+    code { background: #f3f3f3; padding: 2px 6px; border-radius: 3px; }
+    h1 { margin-top: 0; }
+    .hint { color: #888; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>Neo4j HA Agent</h1>
+  <p>The Web UI bundle has not been built yet. Build it with:</p>
+  <pre><code>cd ui &amp;&amp; npm install &amp;&amp; npm run build</code></pre>
+  <p class="hint">
+    Or run the agent's Maven build with the frontend module enabled. The compiled bundle
+    will be served from this path (<code>/</code>) and the API is available at
+    <code>/api/*</code>.
+  </p>
+  <p>API endpoints currently exposed:</p>
+  <ul>
+    <li><a href="/health">/health</a></li>
+    <li><a href="/metrics">/metrics</a></li>
+    <li><code>POST /api/login</code>, <code>GET /api/me</code></li>
+    <li><code>GET /api/cluster/status</code>, <code>POST /api/cluster/failover</code></li>
+    <li><code>GET /api/audit</code>, <code>GET /api/metrics-summary</code></li>
+  </ul>
+</body>
+</html>

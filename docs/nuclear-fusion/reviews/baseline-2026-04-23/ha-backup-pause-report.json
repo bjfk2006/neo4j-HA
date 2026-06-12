@@ -1,0 +1,194 @@
+{
+  "initial_primary": "node-03",
+  "final_primary": "node-03",
+  "returned_to_initial": true,
+  "rotations_requested": 1,
+  "switchover_events": [],
+  "write_summary": {
+    "count": 3002,
+    "ok": 3002,
+    "fail": 0,
+    "error_rate": 0.0,
+    "latency_ms": {
+      "p50": 6.06,
+      "p95": 8.46,
+      "p99": 10.09,
+      "max": 62.69
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 3001,
+        "ok": 3001,
+        "fail": 0
+      },
+      "stopping": {
+        "total": 1,
+        "ok": 1,
+        "fail": 0
+      }
+    }
+  },
+  "read_summary": {
+    "count": 3002,
+    "ok": 3002,
+    "fail": 0,
+    "error_rate": 0.0,
+    "latency_ms": {
+      "p50": 1.42,
+      "p95": 2.12,
+      "p99": 2.55,
+      "max": 29.35
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 3001,
+        "ok": 3001,
+        "fail": 0
+      },
+      "stopping": {
+        "total": 1,
+        "ok": 1,
+        "fail": 0
+      }
+    }
+  },
+  "rel_summary": {
+    "count": 1501,
+    "ok": 1221,
+    "fail": 280,
+    "error_rate": 0.18654230512991338,
+    "latency_ms": {
+      "p50": 7.49,
+      "p95": 11.51,
+      "p99": 13.71,
+      "max": 18.86
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 1501,
+        "ok": 1221,
+        "fail": 280
+      }
+    }
+  },
+  "delete_summary": {
+    "count": 601,
+    "ok": 273,
+    "fail": 328,
+    "error_rate": 0.5457570715474209,
+    "latency_ms": {
+      "p50": 5.65,
+      "p95": 9.5,
+      "p99": 11.78,
+      "max": 60.25
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 601,
+        "ok": 273,
+        "fail": 328
+      }
+    }
+  },
+  "gds_summary": {
+    "count": 2,
+    "ok": 2,
+    "fail": 0,
+    "error_rate": 0.0,
+    "latency_ms": {
+      "p50": 2922.84,
+      "p95": 3015.08,
+      "p99": 3023.28,
+      "max": 3025.33
+    },
+    "by_phase": {
+      "steady-0": {
+        "total": 2,
+        "ok": 2,
+        "fail": 0
+      }
+    }
+  },
+  "expected_written_count": 3002,
+  "expected_present_count": 2759,
+  "deleted_count": 243,
+  "failed_write_count": 0,
+  "expected_rel_pairs": 1221,
+  "gds_community_runs": 2,
+  "community_reference_node": "node-01",
+  "integrity_ok": true,
+  "per_node": {
+    "node-01": {
+      "ok": true,
+      "count_total": 9117,
+      "count_current_run": 2759,
+      "missing_count": 0,
+      "extra_count": 0,
+      "missing_sample": [],
+      "extra_sample": [],
+      "delete_leak_count": 0,
+      "delete_leak_sample": [],
+      "rel_count": 1221,
+      "rel_missing_count": 0,
+      "rel_extra_count": 0,
+      "rel_missing_sample": [],
+      "rel_extra_sample": [],
+      "community_nodes": 2194,
+      "community_distinct": 1260,
+      "community_matches_reference": true,
+      "stale_count": 6358,
+      "stale_writers": [
+        "w-e4f8ce",
+        "w-c83ef6"
+      ]
+    },
+    "node-02": {
+      "ok": true,
+      "count_total": 9117,
+      "count_current_run": 2759,
+      "missing_count": 0,
+      "extra_count": 0,
+      "missing_sample": [],
+      "extra_sample": [],
+      "delete_leak_count": 0,
+      "delete_leak_sample": [],
+      "rel_count": 1221,
+      "rel_missing_count": 0,
+      "rel_extra_count": 0,
+      "rel_missing_sample": [],
+      "rel_extra_sample": [],
+      "community_nodes": 2194,
+      "community_distinct": 1260,
+      "community_matches_reference": true,
+      "stale_count": 6358,
+      "stale_writers": [
+        "w-e4f8ce",
+        "w-c83ef6"
+      ]
+    },
+    "node-03": {
+      "ok": true,
+      "count_total": 9117,
+      "count_current_run": 2759,
+      "missing_count": 0,
+      "extra_count": 0,
+      "missing_sample": [],
+      "extra_sample": [],
+      "delete_leak_count": 0,
+      "delete_leak_sample": [],
+      "rel_count": 1221,
+      "rel_missing_count": 0,
+      "rel_extra_count": 0,
+      "rel_missing_sample": [],
+      "rel_extra_sample": [],
+      "community_nodes": 2194,
+      "community_distinct": 1260,
+      "community_matches_reference": true,
+      "stale_count": 6358,
+      "stale_writers": [
+        "w-e4f8ce",
+        "w-c83ef6"
+      ]
+    }
+  }
+}
