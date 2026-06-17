@@ -354,17 +354,6 @@ public class CdcCollector {
 
             this.lastStreamId = streamId;
 
-            // Cleanup delete event transit nodes (publish succeeded)
-            long maxDeleteTs = rawChanges.stream()
-                .filter(r -> r.type().name().contains("DELETED"))
-                .mapToLong(RawChange::timestamp)
-                .max().orElse(-1);
-            if (maxDeleteTs > 0) {
-                try (Session session = currentDriver.session(SessionConfig.forDatabase(database))) {
-                    pollingStrategy.getDeleteCapture().cleanupDeleteEvents(session, maxDeleteTs);
-                }
-            }
-
             // BUG-057: advance each cursor from the LAST record of ITS OWN
             // kind, never from the merged batch's global last. Otherwise a
             // relationship eid ("5:...") would overwrite the node cursor and
@@ -396,12 +385,35 @@ public class CdcCollector {
                     pollingState.setLastRelEid(lastRel.elementId());
                 });
 
-            // Delete cursor is keyed off _CDCDeleteEvent transit nodes and
-            // has always been independent. Unchanged logic.
+            // BUG-087: clean up ONLY the delete-event transit nodes actually
+            // captured AND published in THIS batch, bounded by the same
+            // (timestamp, _elementId) keyset the capture query pages by, then
+            // advance the delete cursor to that same boundary.
+            //
+            // The previous code deleted every _CDCDeleteEvent with
+            // `timestamp <= maxDeleteTs` right after publish. Because
+            // `timestamp()` is constant within a transaction, a single
+            // DETACH DELETE of more than batchSize entities creates more
+            // same-timestamp transit nodes than one batch can capture; the
+            // threshold cleanup then destroyed the un-captured same-timestamp
+            // overflow BEFORE it was ever published, so those deletes never
+            // reached standbys (standby kept data the primary had deleted →
+            // standby > primary). Bounding cleanup to the captured keyset
+            // prefix keeps the overflow alive for the next poll.
+            //
+            // `rawChanges` is globally sorted by (timestamp, elementId), and
+            // RawChange.elementId() for a delete is the deleted entity's
+            // `_elementId` — the exact key the capture query now orders and
+            // paginates by — so the last DELETED record is the batch's
+            // (maxTs, lastEid) boundary.
             rawChanges.stream()
                 .filter(r -> r.type().name().contains("DELETED"))
                 .reduce((a, b) -> b)
                 .ifPresent(lastDelete -> {
+                    try (Session session = currentDriver.session(SessionConfig.forDatabase(database))) {
+                        pollingStrategy.getDeleteCapture().cleanupCapturedDeleteEvents(
+                            session, lastDelete.timestamp(), lastDelete.elementId());
+                    }
                     pollingState.setLastDeleteTs(lastDelete.timestamp());
                     pollingState.setLastDeleteEid(lastDelete.elementId());
                 });

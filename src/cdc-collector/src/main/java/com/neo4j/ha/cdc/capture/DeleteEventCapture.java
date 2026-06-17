@@ -20,18 +20,42 @@ public class DeleteEventCapture {
     private static final Logger log = LoggerFactory.getLogger(DeleteEventCapture.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    // BUG-087: page by the deleted entity's `_elementId` PROPERTY (e.elementId),
+    // NOT the transit node's own `elementId(e)`. The cursor that is fed back in
+    // ($lastDeleteEid) is RawChange.elementId == e.elementId (see
+    // captureDeleteEvents below), and the post-publish cleanup bounds itself on
+    // the same key. Keeping all three — capture keyset, cursor advance, cleanup
+    // boundary — on e.elementId makes the delete path internally consistent so
+    // same-timestamp overflow is paged across polls instead of being dropped.
     private static final String CAPTURE_QUERY = """
         MATCH (e:_CDCDeleteEvent)
         WHERE e.timestamp > $lastDeleteTs
-           OR (e.timestamp = $lastDeleteTs AND elementId(e) > $lastDeleteEid)
+           OR (e.timestamp = $lastDeleteTs AND e.elementId > $lastDeleteEid)
         RETURN e, elementId(e) AS eid
-        ORDER BY e.timestamp ASC, elementId(e) ASC
+        ORDER BY e.timestamp ASC, e.elementId ASC
         LIMIT $batchSize
         """;
 
+    // BUG-067 startup sweep ONLY. Threshold delete of every orphan transit node
+    // older than a cutoff. Correct for "garbage-collect a previous tenure's
+    // leftovers" but UNSAFE as a post-publish cleanup — see
+    // cleanupCapturedDeleteEvents for why.
     private static final String CLEANUP_QUERY = """
         MATCH (e:_CDCDeleteEvent)
         WHERE e.timestamp <= $publishedTs
+        WITH e LIMIT 10000
+        DETACH DELETE e
+        RETURN count(*) AS deleted
+        """;
+
+    // BUG-087: bounded cleanup of exactly the keyset prefix captured this batch:
+    // everything strictly below maxTs, plus — at maxTs — only transit nodes with
+    // e.elementId <= lastEid (the last captured boundary). Same-timestamp
+    // overflow (e.elementId > lastEid at maxTs) survives for the next poll.
+    private static final String CLEANUP_CAPTURED_QUERY = """
+        MATCH (e:_CDCDeleteEvent)
+        WHERE e.timestamp < $maxTs
+           OR (e.timestamp = $maxTs AND e.elementId <= $lastEid)
         WITH e LIMIT 10000
         DETACH DELETE e
         RETURN count(*) AS deleted
@@ -85,6 +109,43 @@ public class DeleteEventCapture {
         long deleted = result.single().get("deleted").asLong();
         if (deleted > 0) {
             log.info("Cleaned up {} _CDCDeleteEvent transit nodes", deleted);
+        }
+        return deleted;
+    }
+
+    /**
+     * BUG-087: clean up ONLY the delete-event transit nodes actually captured
+     * (and published) in the current poll batch, keyed on the same
+     * {@code (timestamp, e.elementId)} keyset the capture query pages by.
+     *
+     * <p>The legacy {@link #cleanupDeleteEvents} deletes every
+     * {@code _CDCDeleteEvent} with {@code timestamp <= publishedTs}. As a
+     * post-publish cleanup that is unsafe: {@code timestamp()} is constant
+     * within a transaction, so a single {@code DETACH DELETE} of more than
+     * {@code batchSize} entities produces more same-timestamp transit nodes
+     * than one batch can capture. The capture query pages the
+     * {@code (timestamp, e.elementId)} keyset and stops at {@code batchSize};
+     * a threshold cleanup would then delete the un-captured same-timestamp
+     * overflow BEFORE it was ever published, so those deletes never reach
+     * standbys — leaving them holding data the primary already deleted
+     * (standby &gt; primary).</p>
+     *
+     * <p>This deletes exactly the captured keyset prefix — everything strictly
+     * below {@code maxTs}, plus at {@code maxTs} only transit nodes with
+     * {@code e.elementId <= lastEid} — so same-timestamp overflow survives and
+     * the next poll pages into it via {@code e.elementId > lastEid}.</p>
+     *
+     * @param maxTs   timestamp of the last captured delete event (batch max)
+     * @param lastEid {@code _elementId} of the last captured delete event at {@code maxTs}
+     */
+    public long cleanupCapturedDeleteEvents(Session session, long maxTs, String lastEid) {
+        var result = session.run(CLEANUP_CAPTURED_QUERY, Map.of(
+            "maxTs", maxTs,
+            "lastEid", lastEid != null ? lastEid : ""
+        ));
+        long deleted = result.single().get("deleted").asLong();
+        if (deleted > 0) {
+            log.info("Cleaned up {} captured _CDCDeleteEvent transit nodes", deleted);
         }
         return deleted;
     }
