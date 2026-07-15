@@ -36,9 +36,9 @@ public class StreamPublishService {
      * Append events to the local PublishBuffer without trying to publish them to
      * Redis. Used by {@code CdcCollector.pollLoop} when a {@link FencingTokenRejectedException}
      * is seen mid-publish (BUG-047 defence in depth) — the events have already been
-     * extracted from Neo4j and we do not want to lose them. A subsequent
-     * {@code start()} on the new primary will call {@link #retryBuffered()} on every
-     * tick and the next epoch's poll will flush them with the current token.
+     * extracted from Neo4j and we do not want to lose them. Every poll tick calls
+     * {@link #retryBuffered()} (directly on empty polls, via {@link #publishBatch}
+     * otherwise — BUG-088), so the next epoch flushes them with the current token.
      */
     public void bufferForRetry(List<ChangeEvent> events) {
         if (events == null || events.isEmpty()) return;
@@ -65,9 +65,13 @@ public class StreamPublishService {
         } catch (FencingTokenRejectedException e) {
             throw e;
         } catch (Exception e) {
-            log.warn("Failed to publish to Redis, buffering {} events", events.size(), e);
-            publishBuffer.add(events);
-            metrics.bufferSize.set(publishBuffer.size());
+            // BUG-088: do NOT buffer here. The caller keeps its polling cursors
+            // on a null return (C1), so the same changes are re-read on the next
+            // poll; buffering them too duplicated the batch every 100ms for the
+            // whole outage (observed 482MB of copies in a 3-minute Redis outage),
+            // and rebuilt eventIds defeat the standby's DuplicateDetector.
+            log.warn("Failed to publish {} events to Redis; cursors stay put and the next poll re-reads them",
+                events.size(), e);
             return null;
         }
     }

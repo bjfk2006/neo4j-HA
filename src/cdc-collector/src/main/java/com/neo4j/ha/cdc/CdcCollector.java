@@ -322,6 +322,11 @@ public class CdcCollector {
             // Detect changes
             List<RawChange> rawChanges = pollingStrategy.detectChanges(pollingState, config.batchSize());
             if (rawChanges.isEmpty()) {
+                // BUG-088: drain the local publish buffer even when the primary
+                // is idle. retryBuffered() was previously reachable only through
+                // publishBatch(), so once polling caught up the disk backlog was
+                // never flushed and the CDC pipeline appeared stalled.
+                publishService.retryBuffered();
                 // BUG-072: emit a heartbeat checkpoint save so
                 // `HaAgent.evaluateServiceStates` sees a recent updatedAt and
                 // `cdcActive` becomes true even on a pristine empty cluster.

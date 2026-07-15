@@ -40,6 +40,14 @@ public class PublishBuffer {
         } catch (IOException e) {
             log.warn("Failed to create buffer directory: {}", bufferDir, e);
         }
+        // BUG-088: bufferSize tracks memory + disk. Seed it with the events
+        // already sitting in leftover files, otherwise the gauge starts at 0
+        // after a restart and goes negative once those files are drained.
+        long onDisk = countDiskEvents();
+        if (onDisk > 0) {
+            bufferSize.set(onDisk);
+            log.warn("PublishBuffer found {} events in {} leftover disk file(s)", onDisk, diskFileCount());
+        }
     }
 
     public void add(List<ChangeEvent> events) {
@@ -140,7 +148,6 @@ public class PublishBuffer {
                 writer.write(json);
                 writer.newLine();
                 bytesWritten += json.length() + 1;
-                bufferSize.decrementAndGet();
                 count++;
             }
             log.info("Flushed {} events to {}", count, filePath);
@@ -177,5 +184,18 @@ public class PublishBuffer {
         } catch (IOException e) {
             return 0;
         }
+    }
+
+    private long countDiskEvents() {
+        File[] files = bufferDir.toFile().listFiles((dir, name) -> name.endsWith(".jsonl"));
+        if (files == null) return 0;
+        long total = 0;
+        for (File f : files) total += countLines(f);
+        return total;
+    }
+
+    private int diskFileCount() {
+        File[] files = bufferDir.toFile().listFiles((dir, name) -> name.endsWith(".jsonl"));
+        return files == null ? 0 : files.length;
     }
 }
