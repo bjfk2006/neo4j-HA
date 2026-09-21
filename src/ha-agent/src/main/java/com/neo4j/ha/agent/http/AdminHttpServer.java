@@ -148,6 +148,7 @@ public class AdminHttpServer {
         app.get("/api/cluster/nodes/{id}", this::handleNodeDetail);
         app.post("/api/cluster/failover", ctx -> {
             AuthFilter.requireWriter(ctx);
+            if (rejectIfSwitchInProgress(ctx, "failover")) return;
             String nodeId = ctx.queryParam("nodeId");
             if (nodeId == null) nodeId = clusterState.getPrimaryNodeId();
             final String finalNodeId = nodeId;
@@ -158,6 +159,7 @@ public class AdminHttpServer {
         });
         app.post("/api/cluster/switchover", ctx -> {
             AuthFilter.requireWriter(ctx);
+            if (rejectIfSwitchInProgress(ctx, "switchover")) return;
             String targetNodeId = ctx.queryParam("targetNodeId");
             auditOp(ctx, "switchover", "targetNodeId=" + targetNodeId);
             new Thread(() -> failoverOrchestrator.executeSwitchover(targetNodeId),
@@ -215,6 +217,7 @@ public class AdminHttpServer {
         app.get("/cluster/nodes/{id}", this::handleNodeDetail);
         app.post("/cluster/failover", ctx -> {
             AuthFilter.requireWriter(ctx);
+            if (rejectIfSwitchInProgress(ctx, "failover")) return;
             String nodeId = ctx.queryParam("nodeId");
             if (nodeId == null) nodeId = clusterState.getPrimaryNodeId();
             final String finalNodeId = nodeId;
@@ -225,6 +228,7 @@ public class AdminHttpServer {
         });
         app.post("/cluster/switchover", ctx -> {
             AuthFilter.requireWriter(ctx);
+            if (rejectIfSwitchInProgress(ctx, "switchover")) return;
             String targetNodeId = ctx.queryParam("targetNodeId");
             auditOp(ctx, "switchover", "targetNodeId=" + targetNodeId);
             new Thread(() -> failoverOrchestrator.executeSwitchover(targetNodeId),
@@ -305,6 +309,34 @@ public class AdminHttpServer {
             return;
         }
         ctx.json(info);
+    }
+
+    /**
+     * REVIEW-F2: guard for the two role-changing endpoints. These used to
+     * fire-and-forget a raw {@code new Thread(...)} straight into the
+     * orchestrator, bypassing the only mutual exclusion in the system (which
+     * lived in HaAgent and covered just the health-checker path). Two admin
+     * requests — or one admin request racing an automatic failover — could
+     * therefore run two switches at once.
+     *
+     * <p>Real mutual exclusion now lives in {@link FailoverOrchestrator}; this
+     * is the advisory pre-check that turns "silently refused in a detached
+     * thread" into a proper {@code 409 Conflict} for the caller. A request that
+     * slips through the pre-check still gets refused by the orchestrator's
+     * {@code tryLock} and is recorded in the audit log.</p>
+     *
+     * @return true if the caller should proceed; false if a 409 was already sent.
+     */
+    private boolean rejectIfSwitchInProgress(Context ctx, String what) {
+        if (!failoverOrchestrator.isSwitchInProgress()) return false;
+        String active = failoverOrchestrator.getActiveOperation();
+        log.warn("{} rejected with 409: {} already in progress", what, active);
+        ctx.status(409).json(Map.of(
+            "error", "switch_in_progress",
+            "message", "Another failover/switchover is already running; retry once it finishes.",
+            "activeOperation", active == null ? "unknown" : active
+        ));
+        return true;
     }
 
     private void auditOp(Context ctx, String op, String params) {

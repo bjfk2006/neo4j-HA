@@ -76,12 +76,40 @@ public class InflightTxDrainWaiter {
      * for every active tx the caller is authorized to see. The agent connects
      * as the {@code neo4j} admin user so it sees everything.
      */
+    /**
+     * REVIEW-C9: the filter claimed to count "external write tx" but only
+     * excluded {@code SHOW TRANSACTIONS} itself.
+     *
+     * <p>Phase 2.5 runs right after {@code blockWrites}, which only stops
+     * traffic <i>through HAProxy</i>. The agent talks to Neo4j over direct Bolt,
+     * so at that exact moment its own CDC keyset poll (every 100 ms by default)
+     * and its L3/L4 health probes (every 2 s) are still running and were counted
+     * as in-flight client transactions. {@code consecutiveZero} then rarely
+     * reached 2 and the drain ran the full {@code maxWaitMs}, logging
+     * "timed out ... with N external write tx still in-flight" on a cluster that
+     * was in fact fully quiesced — noise that trains operators to ignore a
+     * genuinely important error line, plus 3 s added to every switchover.</p>
+     *
+     * <p>The agent's own statements are recognised by the HA-internal
+     * identifiers they must reference: the CDC poll filters on
+     * {@code _updated_at}, the delete capture reads {@code _CDCDeleteEvent},
+     * the probes use {@code _HealthCheck} / {@code _TriggerReadinessProbe} /
+     * {@code _PROBE_REL}. These are reserved names owned by this system — a
+     * client statement mentioning them would be corrupting CDC state anyway.</p>
+     */
     private static final String COUNT_QUERY =
         "SHOW TRANSACTIONS " +
         "YIELD database, currentQuery, status, transactionId " +
         "WHERE database = $db " +
         "  AND currentQuery IS NOT NULL " +
         "  AND NOT currentQuery STARTS WITH 'SHOW TRANSACTIONS' " +
+        "  AND NOT currentQuery STARTS WITH 'CALL db.' " +
+        "  AND NOT currentQuery STARTS WITH 'CALL apoc.' " +
+        "  AND NOT currentQuery CONTAINS '_updated_at' " +
+        "  AND NOT currentQuery CONTAINS '_CDCDeleteEvent' " +
+        "  AND NOT currentQuery CONTAINS '_HealthCheck' " +
+        "  AND NOT currentQuery CONTAINS '_TriggerReadinessProbe' " +
+        "  AND NOT currentQuery CONTAINS '_PROBE_REL' " +
         "RETURN count(*) AS n";
 
     private final long minWaitMs;

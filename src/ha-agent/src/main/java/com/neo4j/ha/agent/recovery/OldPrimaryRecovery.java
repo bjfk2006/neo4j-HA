@@ -44,6 +44,14 @@ public class OldPrimaryRecovery {
     private final FailoverAuditLog audit;
     private final HaMetrics metrics;
     private final String changesStreamKey;
+    /**
+     * REVIEW-H3: the user database was hardcoded to "neo4j" in three places here
+     * ({@code ensureIndexes}, {@code PostSwitchoverReconciler}, and the untargeted
+     * {@code driver.session()}), even though {@code cluster.nodes[].neo4j.database}
+     * is a real config knob. On any deployment using a non-default database the
+     * recovery silently indexed / reconciled / cleaned the wrong database.
+     */
+    private final String database;
     private final long fullsyncMinIntervalMs;
 
     /**
@@ -76,16 +84,17 @@ public class OldPrimaryRecovery {
                                CdcCollector cdcCollector,
                                CheckpointManager checkpointManager, NodeRegistry nodeRegistry,
                                IndexInstaller indexInstaller, FailoverAuditLog audit,
-                               HaMetrics metrics, String changesStreamKey) {
+                               HaMetrics metrics, String changesStreamKey, String database) {
         this(clusterState, syncApplier, cdcCollector, checkpointManager, nodeRegistry,
-                indexInstaller, audit, metrics, changesStreamKey, DEFAULT_FULLSYNC_MIN_INTERVAL_MS);
+                indexInstaller, audit, metrics, changesStreamKey, database,
+                DEFAULT_FULLSYNC_MIN_INTERVAL_MS);
     }
 
     public OldPrimaryRecovery(ClusterStateManager clusterState, SyncApplier syncApplier,
                                CdcCollector cdcCollector,
                                CheckpointManager checkpointManager, NodeRegistry nodeRegistry,
                                IndexInstaller indexInstaller, FailoverAuditLog audit,
-                               HaMetrics metrics, String changesStreamKey,
+                               HaMetrics metrics, String changesStreamKey, String database,
                                long fullsyncMinIntervalMs) {
         this.clusterState = clusterState;
         this.syncApplier = syncApplier;
@@ -96,10 +105,30 @@ public class OldPrimaryRecovery {
         this.audit = audit;
         this.metrics = metrics;
         this.changesStreamKey = changesStreamKey;
+        this.database = (database == null || database.isBlank()) ? "neo4j" : database;
         this.fullsyncMinIntervalMs = fullsyncMinIntervalMs;
     }
 
     public void execute(String oldPrimaryId) {
+        // REVIEW-R2: recovery tasks and failover tasks share one single-thread
+        // executor, so a queued recovery can be overtaken by a failover that
+        // promotes the very node this recovery is about to demote. Concrete
+        // double-fault sequence:
+        //   node-01 fails over out   -> recovery(node-01) queued
+        //   node-02 then fails       -> failover promotes node-01 back to PRIMARY
+        //   queued recovery(node-01) finally runs
+        // Without this guard Step 1 uninstalls the CDC triggers from the LIVE
+        // primary (so no write is ever captured again), Step 3 demotes it to
+        // STANDBY, and Step 6 subscribes SyncApplier to replay onto itself.
+        String primaryAtEntry = clusterState.getPrimaryNodeId();
+        if (oldPrimaryId != null && oldPrimaryId.equals(primaryAtEntry)) {
+            log.warn("Skipping old-primary recovery for {}: it is the CURRENT primary "
+                + "(promoted while this task was queued). Running it would uninstall the "
+                + "live primary's CDC triggers and demote it.", oldPrimaryId);
+            nodeRegistry.markPendingCleanup(oldPrimaryId, false);
+            return;
+        }
+
         log.info("Starting old primary recovery for node: {}", oldPrimaryId);
         audit.logRecoveryStart(oldPrimaryId);
         metrics.oldPrimaryRecoveryTotal.increment();
@@ -108,7 +137,17 @@ public class OldPrimaryRecovery {
         try {
             // Step 1: Uninstall APOC triggers (BUG-046: must succeed or we abort recovery;
             // otherwise the node still mutates _updated_at on SyncApplier MERGE).
-            boolean triggersOk = ApocTriggerUninstaller.uninstall(oldDriver);
+            // REVIEW-R1: gate on triggersDropped() ONLY. The afterAsync drain result is
+            // reported separately — a drain that could not be confirmed means some rel
+            // stamps may be missing (the healer repairs those), not that the node is
+            // still armed with triggers.
+            var uninstallResult = ApocTriggerUninstaller.uninstallDetailed(oldDriver, database);
+            if (!uninstallResult.afterAsyncDrained() && !uninstallResult.drainSkipped()) {
+                log.warn("Recovery of {}: afterAsync drain not confirmed; some relationships may "
+                    + "be missing their stamps on this node. Continuing — NakedRelationshipHealer "
+                    + "covers this case.", oldPrimaryId);
+            }
+            boolean triggersOk = uninstallResult.triggersDropped();
             if (!triggersOk) {
                 audit.logRecoveryFailed(oldPrimaryId, new IllegalStateException(
                     "APOC trigger uninstall did not fully succeed; aborting recovery to avoid data corruption"));
@@ -129,7 +168,9 @@ public class OldPrimaryRecovery {
             log.info("Step 3: {} role set to STANDBY/SYNCING", oldPrimaryId);
 
             // Step 4: Ensure standby indexes
-            indexInstaller.ensureIndexes(oldDriver, "neo4j");
+            // REVIEW-B1: recovery runs on the single ha-failover thread; a
+            // full-graph dup scan here would block real failovers behind it.
+            indexInstaller.ensureIndexes(oldDriver, database, false);
             log.info("Step 4: Standby indexes ensured on {}", oldPrimaryId);
 
             // Step 4.5 (BUG-080): reverse-reconcile afterAsync writes that were
@@ -175,7 +216,7 @@ public class OldPrimaryRecovery {
                             "current primary {} (failoverTs={}, cursors rel={}, del={})",
                             oldPrimaryId, currentPrimary, p.failoverTs(),
                             p.lastRelTs(), p.lastDeleteTs());
-                        var reconciler = new PostSwitchoverReconciler(clusterState, "neo4j");
+                        var reconciler = new PostSwitchoverReconciler(clusterState, database);
                         int replayed = reconciler.reconcile(
                             oldPrimaryId, currentPrimary,
                             p.lastRelTs(), p.lastDeleteTs());
@@ -201,13 +242,44 @@ public class OldPrimaryRecovery {
             // The full sync path must (a) register the node as a sync target so the FullSyncReceiver
             // exists on the SyncApplier side, AND (b) actually trigger FullSyncCoordinator to publish
             // FULL_SYNC_START/BATCH*/END. Without (b) the receiver would sit in IDLE forever (M1).
-            syncApplier.addTarget(oldDriver, oldPrimaryId);
+            // REVIEW-R3: only subscribe the node to incremental replay once we know
+            // how it is going to catch up. The old code called addTarget()
+            // unconditionally, so a FULL_SYNC decision whose export was then
+            // suppressed by the BUG-039 rate limit left the node consuming the
+            // changes stream from a checkpoint already known to be invalid — the
+            // gap between "what it has" and "where the stream starts" is silently
+            // skipped, then its lag drops below the threshold and
+            // evaluateServiceStates promotes it to ONLINE and sends reads to it.
+            boolean fullSyncStarting = false;
             if (decision == SyncDecision.FULL_SYNC) {
-                // BUG-039 rate limit: a flapping node (up → down → up) must not trigger
-                // back-to-back fullsync exports. Each one pulls the full graph from the
-                // current primary; multiple in parallel would pin Neo4j IO/CPU and
-                // cascade to other standbys. Operator can still force via Admin API.
-                if (canStartAutoFullsync(oldPrimaryId)) {
+                fullSyncStarting = canStartAutoFullsync(oldPrimaryId);
+                if (!fullSyncStarting) {
+                    long lastMs = lastAutoFullsyncByNode.getOrDefault(oldPrimaryId, 0L);
+                    long sinceMs = System.currentTimeMillis() - lastMs;
+                    log.error("Auto full-sync for {} SUPPRESSED (last one {} ms ago < min interval "
+                        + "{} ms) and its checkpoint is INVALID. Node is NOT being added as a sync "
+                        + "target: replaying from an invalid checkpoint would silently skip the gap "
+                        + "and the node would later be promoted ONLINE with divergent data. It stays "
+                        + "SYNCING/out-of-rotation until an operator runs "
+                        + "POST /cluster/fullsync?nodeId={}.",
+                        oldPrimaryId, sinceMs, fullsyncMinIntervalMs, oldPrimaryId);
+                    if (metrics != null) {
+                        metrics.autoFullsyncSuppressedTotal.increment();
+                    }
+                    clusterState.setServiceState(oldPrimaryId, NodeServiceState.SYNCING);
+                    nodeRegistry.markPendingCleanup(oldPrimaryId, true);
+                    audit.logRecoveryFailed(oldPrimaryId, new IllegalStateException(
+                        "full-sync suppressed by rate limit and checkpoint invalid; "
+                        + "operator must trigger /cluster/fullsync"));
+                    return;
+                }
+            }
+
+            syncApplier.addTarget(oldDriver, oldPrimaryId);
+            if (fullSyncStarting) {
+                // BUG-039 rate limit was already evaluated above (REVIEW-R3); reaching
+                // here means the export is allowed to start.
+                {
                     markAutoFullsyncStarted(oldPrimaryId);
                     log.info("Triggering full sync export for old primary {}", oldPrimaryId);
                     fullsyncExecutor.submit(() -> {
@@ -233,19 +305,6 @@ public class OldPrimaryRecovery {
                             lastAutoFullsyncByNode.remove(oldPrimaryId);
                         }
                     });
-                } else {
-                    long lastMs = lastAutoFullsyncByNode.getOrDefault(oldPrimaryId, 0L);
-                    long sinceMs = System.currentTimeMillis() - lastMs;
-                    log.warn("Auto full-sync for {} SUPPRESSED: last automatic fullsync was "
-                        + "{} ms ago (< min interval {} ms). Checkpoint is stale, so the node "
-                        + "will NOT re-join ONLINE until either (a) operator runs "
-                        + "POST /cluster/fullsync?targetNodeId={} or (b) this node stabilizes "
-                        + "for {} ms and recovery is re-triggered.",
-                        oldPrimaryId, sinceMs, fullsyncMinIntervalMs,
-                        oldPrimaryId, fullsyncMinIntervalMs);
-                    if (metrics != null) {
-                        metrics.autoFullsyncSuppressedTotal.increment();
-                    }
                 }
             }
             log.info("Step 6-7: Sync started for {}, waiting for ONLINE", oldPrimaryId);
@@ -264,7 +323,8 @@ public class OldPrimaryRecovery {
 
     private long cleanupResidualDeleteEvents(Driver driver) {
         long totalCleaned = 0;
-        try (Session session = driver.session()) {
+        try (Session session = driver.session(
+                org.neo4j.driver.SessionConfig.forDatabase(database))) {
             long cleaned;
             do {
                 cleaned = session.executeWrite(tx ->

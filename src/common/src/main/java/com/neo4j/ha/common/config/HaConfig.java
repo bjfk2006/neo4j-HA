@@ -221,9 +221,36 @@ public record HaConfig(
         Boolean enabled,
         List<UiUserConfig> users,
         UiSessionConfig session,
-        UiRateLimitConfig rateLimit
+        UiRateLimitConfig rateLimit,
+        /**
+         * REVIEW-C6: emit {@code Secure} on the session cookie. The flag was
+         * implemented in {@code AuthController.setSecureCookie} but nothing ever
+         * called it and no config key existed, so it was dead code and the
+         * cookie always went out without {@code Secure}. Default false keeps
+         * plain-HTTP deployments working; set true when the UI is fronted by TLS.
+         */
+        Boolean secureCookie,
+        /**
+         * REVIEW-C4: CIDRs / exact IPs that are allowed to set
+         * {@code X-Forwarded-For}. Empty or absent means "trust nobody" and the
+         * real socket address is used. See {@code AuthController.clientIp}.
+         */
+        List<String> trustedProxies
     ) {
+        /**
+         * Backward-compatible 4-arg form (pre REVIEW-C4/C6 call sites and tests).
+         * Defaults to "no Secure flag, trust no proxy" — the safe choice.
+         */
+        public UiConfig(Boolean enabled, List<UiUserConfig> users,
+                        UiSessionConfig session, UiRateLimitConfig rateLimit) {
+            this(enabled, users, session, rateLimit, Boolean.FALSE, List.of());
+        }
+
         public boolean isEnabled() { return Boolean.TRUE.equals(enabled); }
+        public boolean isSecureCookie() { return Boolean.TRUE.equals(secureCookie); }
+        public List<String> trustedProxiesOrEmpty() {
+            return trustedProxies == null ? List.of() : trustedProxies;
+        }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

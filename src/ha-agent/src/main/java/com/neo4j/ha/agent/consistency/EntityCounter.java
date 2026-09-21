@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -80,9 +81,24 @@ public class EntityCounter {
             // BUG-protected: labels(n) on a node deleted mid-tx throws, so wrap result
             // collection in a list snapshot, not a streaming consume.
             Map<String, Long> byLabel = runWithTimeout(() -> {
-                var rows = session.run(
-                    "MATCH (n) UNWIND labels(n) AS l RETURN l, count(*) AS c "
-                  + "ORDER BY c DESC LIMIT 100").list();
+                // REVIEW-C3: `MATCH (n) UNWIND labels(n) AS l RETURN l, count(*)`
+                // is a full AllNodesScan plus an in-memory grouping — the one
+                // query here that cannot use the counts store. Neo4j answers
+                // `MATCH (n:L) RETURN count(n)` from the counts store in constant
+                // time, so ask per label instead. On a timeout the old form also
+                // left its thread running the scan to completion (Future.cancel
+                // cannot interrupt a blocking Bolt read), burning a slot in the
+                // 32-thread pool; per-label queries are each trivially short.
+                var labels = session.run("CALL db.labels() YIELD label RETURN label")
+                    .list(r -> r.get("label").asString());
+                List<org.neo4j.driver.Record> rows = new java.util.ArrayList<>();
+                for (String label : labels) {
+                    rows.add(session.run(
+                        "MATCH (n:" + sanitizeLabel(label) + ") RETURN $l AS l, count(n) AS c",
+                        java.util.Map.of("l", label)).single());
+                }
+                rows.sort((x, y) -> Long.compare(y.get("c").asLong(), x.get("c").asLong()));
+                if (rows.size() > 100) rows = rows.subList(0, 100);
                 Map<String, Long> map = new LinkedHashMap<>();
                 for (var r : rows) {
                     String label = r.get("l").asString();
@@ -103,6 +119,12 @@ public class EntityCounter {
             long dur = System.currentTimeMillis() - start;
             return new CountResult(null, null, Map.of(), dur, e.getClass().getSimpleName() + ": " + e.getMessage());
         }
+    }
+
+    /** Quote a label for safe interpolation into Cypher (REVIEW-C3). */
+    private static String sanitizeLabel(String name) {
+        if (name != null && name.matches("[a-zA-Z_][a-zA-Z0-9_]*")) return name;
+        return "`" + String.valueOf(name).replace("`", "``") + "`";
     }
 
     private <T> T runWithTimeout(Callable<T> task) throws Exception {

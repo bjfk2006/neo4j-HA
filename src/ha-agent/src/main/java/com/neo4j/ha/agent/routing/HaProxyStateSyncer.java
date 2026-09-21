@@ -12,7 +12,7 @@ import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class HaProxyStateSyncer {
 
@@ -44,8 +44,19 @@ public class HaProxyStateSyncer {
      * <p>The {@link FailoverOrchestrator} calls {@link #pause()} at the start of a
      * switchover and {@link #resume()} at the end (in {@code finally} so failures
      * still unblock us).</p>
+     *
+     * <p><b>REVIEW-F3</b>: this used to be an {@code AtomicBoolean}, which made
+     * pause/resume <i>non-reentrant</i> and silently lost nesting. The concrete
+     * regression: {@code BackupCoordinator.prepare()} pauses for the backup
+     * window; a failover starting inside that window pauses again (CAS fails,
+     * no-op) and then, in Phase 3, calls
+     * {@code backupCoordinator.cancelForFailover()} → {@code rollbackPartialPrepare()}
+     * → {@code resume()}. The reconciler wakes up in the middle of Phase 3..10,
+     * sees "no READY server in write backend" and revives the OLD primary —
+     * exactly the BUG-049 orphan-write scenario this flag was added to prevent.
+     * A counter makes the pause hold until <i>every</i> holder has released.</p>
      */
-    private final AtomicBoolean paused = new AtomicBoolean(false);
+    private final AtomicInteger pauseDepth = new AtomicInteger(0);
 
     public HaProxyStateSyncer(List<HaProxyInstance> instances, ClusterStateManager clusterState,
                                HaProxySocketClient socketClient, String primaryBackend,
@@ -73,24 +84,36 @@ public class HaProxyStateSyncer {
     }
 
     /**
-     * Suspend the periodic reconciler. Idempotent. See field doc on {@link #paused}
-     * for the reason this exists (BUG-049).
+     * Acquire one pause token. Re-entrant: N calls to {@code pause()} require N
+     * calls to {@link #resume()} before the reconciler runs again. See field doc
+     * on {@link #pauseDepth} for why a plain boolean was wrong (BUG-049 / REVIEW-F3).
      */
     public void pause() {
-        if (paused.compareAndSet(false, true)) {
-            log.info("HAProxy state syncer paused (switchover in progress)");
+        int depth = pauseDepth.incrementAndGet();
+        if (depth == 1) {
+            log.info("HAProxy state syncer paused (switchover/backup in progress)");
+        } else {
+            log.info("HAProxy state syncer pause nested (depth={})", depth);
         }
     }
 
-    /** Resume the periodic reconciler. Idempotent. */
+    /** Release one pause token. Never drops below zero. */
     public void resume() {
-        if (paused.compareAndSet(true, false)) {
+        int depth = pauseDepth.updateAndGet(d -> d > 0 ? d - 1 : 0);
+        if (depth == 0) {
             log.info("HAProxy state syncer resumed");
+        } else {
+            log.info("HAProxy state syncer still paused (depth={})", depth);
         }
+    }
+
+    /** Visible for tests / diagnostics. */
+    public boolean isPaused() {
+        return pauseDepth.get() > 0;
     }
 
     private void sync() {
-        if (paused.get()) {
+        if (pauseDepth.get() > 0) {
             // BUG-049: skip reconciliation while a switchover is in flight.
             return;
         }
@@ -115,8 +138,10 @@ public class HaProxyStateSyncer {
         // the bolt host portion of each node's URI, matching the naming in haproxy.cfg.
         var nonPrimaryServers = new java.util.ArrayList<String>();
         for (var n : clusterState.getAllNodes()) {
-            String server = n.boltUri().replace("bolt://", "").split(":")[0];
-            if (!server.equals(expectedPrimary)) {
+            // REVIEW-F4: single shared parser; the inlined replace/split only
+            // handled the bolt:// scheme.
+            String server = ClusterStateManager.serverIdFromBoltUri(n.boltUri());
+            if (server != null && !server.equals(expectedPrimary)) {
                 nonPrimaryServers.add(server);
             }
         }

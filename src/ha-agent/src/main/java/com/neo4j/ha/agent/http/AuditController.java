@@ -1,5 +1,7 @@
 package com.neo4j.ha.agent.http;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.neo4j.ha.agent.audit.FailoverAuditLog;
 import io.javalin.http.Context;
 import org.slf4j.Logger;
@@ -12,6 +14,7 @@ import redis.clients.jedis.resps.StreamEntry;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -34,6 +37,7 @@ public class AuditController {
     private static final Logger log = LoggerFactory.getLogger(AuditController.class);
 
     private static final String UI_AUDIT_STREAM = "neo4j:ha:ui-audit";
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final JedisPool jedisPool;
     private final FailoverAuditLog failoverAuditLog;
@@ -122,21 +126,63 @@ public class AuditController {
         return out;
     }
 
+    /**
+     * REVIEW-C7: parse the JSON written by {@code FailoverAuditLog} and use the
+     * event's REAL {@code endTime} as the sort key.
+     *
+     * <p>Previously the stored form was {@code FailoverEvent.toString()}, which
+     * is unparseable, so this method fabricated a timestamp
+     * ({@code now - index}). Consequence: every historical failover rendered as
+     * having happened "just now" and, because the merged list is sorted by
+     * {@code ts} descending, they always floated above the genuinely recent
+     * UI-audit entries. The one view an operator opens to reconstruct an
+     * incident timeline was the one view that could not show a timeline.</p>
+     *
+     * <p>Entries written by an older build are still legacy {@code toString()}
+     * text; those are surfaced as before (raw + synthetic ts) but explicitly
+     * flagged so nobody trusts their ordering.</p>
+     */
     private List<Map<String, Object>> readFailoverHistory(int limit) {
         List<Map<String, Object>> out = new ArrayList<>();
         for (String raw : failoverAuditLog.getHistory(limit)) {
             Map<String, Object> m = new HashMap<>();
             m.put("source", "failover-history");
-            m.put("id", null);
-            // FailoverEvent.toString() is opaque; ts not directly parseable —
-            // best effort: assume newest first from List and assign monotonic
-            // pseudo-ts using current time + index offset (UI sorts on ts).
-            m.put("ts", System.currentTimeMillis() - out.size());
             m.put("type", "failover.record");
-            m.put("details", Map.of("raw", raw));
+            try {
+                JsonNode n = MAPPER.readTree(raw);
+                m.put("id", text(n, "eventId"));
+                long endTime = n.hasNonNull("endTime") ? n.get("endTime").asLong() : 0L;
+                m.put("ts", endTime);
+                Map<String, Object> details = new LinkedHashMap<>();
+                details.put("failedNodeId", text(n, "failedNodeId"));
+                details.put("newPrimaryId", text(n, "newPrimaryId"));
+                details.put("fencingToken", n.hasNonNull("fencingToken")
+                    ? n.get("fencingToken").asLong() : 0L);
+                details.put("startTime", n.hasNonNull("startTime")
+                    ? n.get("startTime").asLong() : 0L);
+                details.put("endTime", endTime);
+                details.put("durationMs", n.hasNonNull("startTime") && endTime > 0
+                    ? endTime - n.get("startTime").asLong() : null);
+                details.put("result", text(n, "result"));
+                details.put("reason", text(n, "reason"));
+                m.put("details", details);
+            } catch (Exception parseFailure) {
+                // Pre-REVIEW-C7 entry: opaque record text, no usable timestamp.
+                m.put("id", null);
+                m.put("ts", 0L);
+                m.put("details", Map.of(
+                    "raw", raw,
+                    "legacyFormat", true,
+                    "note", "written before REVIEW-C7; timestamp unknown, ordering unreliable"));
+            }
             out.add(m);
         }
         return out;
+    }
+
+    private static String text(JsonNode n, String field) {
+        JsonNode v = n.get(field);
+        return v == null || v.isNull() ? null : v.asText();
     }
 
     private static int parseLimit(String s) {

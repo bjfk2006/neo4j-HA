@@ -50,33 +50,47 @@ public class ClusterStateManager {
         log.info("Primary node set to: {}", nodeId);
     }
 
+    /**
+     * REVIEW-S2: every mutator here used to be a non-atomic
+     * {@code get() → withXxx() → put()}. {@code nodes} is a ConcurrentHashMap,
+     * but that only makes each individual operation safe — the read-modify-write
+     * as a whole was not, and four different threads run these concurrently:
+     * {@code health-checker} (updateHealth), {@code ha-maintenance}
+     * (setServiceState / updateSyncLag), {@code ha-failover} (updateRole /
+     * setPrimary / setServiceState) and Javalin HTTP threads.
+     *
+     * <p>The dangerous interleaving is a lost update on {@code role}: failover
+     * Phase 7 calls {@code updateRole(newPrimary, PRIMARY)} while the 5 s
+     * service-state evaluator concurrently calls
+     * {@code setServiceState(newPrimary, ONLINE)} from a snapshot taken before
+     * the role change. Whichever writes last wins with its stale copy of the
+     * other field — if that is the service-state writer, the freshly promoted
+     * primary reverts to {@code STANDBY}, which puts it into
+     * {@code getStandbyDrivers()} and makes SyncApplier replay CDC events onto
+     * the primary itself.</p>
+     *
+     * <p>{@code compute} performs the whole read-modify-write atomically under
+     * the map's per-bin lock, so concurrent field updates now compose instead of
+     * clobbering each other.</p>
+     */
     public void updateRole(String nodeId, NodeRole role) {
-        NodeInfo info = nodes.get(nodeId);
-        if (info != null) {
-            nodes.put(nodeId, info.withRole(role));
-        }
+        nodes.computeIfPresent(nodeId, (k, info) -> info.withRole(role));
     }
 
     public void updateHealth(String nodeId, NodeHealth health) {
-        NodeInfo info = nodes.get(nodeId);
-        if (info != null) {
-            nodes.put(nodeId, info.withHealth(health));
-        }
+        nodes.computeIfPresent(nodeId, (k, info) -> info.withHealth(health));
     }
 
     public void setServiceState(String nodeId, NodeServiceState state) {
-        NodeInfo info = nodes.get(nodeId);
-        if (info != null) {
-            nodes.put(nodeId, info.withServiceState(state));
+        NodeInfo updated = nodes.computeIfPresent(nodeId,
+            (k, info) -> info.withServiceState(state));
+        if (updated != null) {
             log.info("Node {} service state changed to {}", nodeId, state);
         }
     }
 
     public void setPendingCleanup(String nodeId, boolean pendingCleanup) {
-        NodeInfo info = nodes.get(nodeId);
-        if (info != null) {
-            nodes.put(nodeId, info.withPendingCleanup(pendingCleanup));
-        }
+        nodes.computeIfPresent(nodeId, (k, info) -> info.withPendingCleanup(pendingCleanup));
     }
 
     /**
@@ -88,10 +102,8 @@ public class ClusterStateManager {
      * runs every 5s on every standby — would be log spam.
      */
     public void updateSyncLag(String nodeId, long syncLagMs) {
-        NodeInfo info = nodes.get(nodeId);
-        if (info != null && info.syncLagMs() != syncLagMs) {
-            nodes.put(nodeId, info.withSyncLagMs(syncLagMs));
-        }
+        nodes.computeIfPresent(nodeId,
+            (k, info) -> info.syncLagMs() == syncLagMs ? info : info.withSyncLagMs(syncLagMs));
     }
 
     public NodeServiceState getServiceState(String nodeId) {
@@ -136,8 +148,38 @@ public class ClusterStateManager {
         if (nodeId == null) return null;
         NodeInfo n = nodes.get(nodeId);
         if (n == null) return null;
-        String uri = n.boltUri();
+        return serverIdFromBoltUri(n.boltUri());
+    }
+
+    /**
+     * Extract the host portion of a Bolt URI — the name HAProxy knows the
+     * server by.
+     *
+     * <p>REVIEW-F4: this logic was copy-pasted in three places
+     * ({@code HaAgent.evaluateServiceStates}, {@code HaProxyStateSyncer.sync}
+     * and here), all written as {@code uri.replace("bolt://", "").split(":")[0]}.
+     * That only works for the {@code bolt://} scheme: given {@code neo4j://h:7687}
+     * or {@code bolt+s://h:7687} the {@code replace} is a no-op and the result is
+     * the literal string {@code "neo4j"} / {@code "bolt+s"} — a server name
+     * HAProxy has never heard of, so every {@code set server} silently targets
+     * nothing and routing is never actually updated. Parsing the scheme properly
+     * (and handling userinfo and bracketed IPv6 hosts) removes that trap.</p>
+     */
+    public static String serverIdFromBoltUri(String uri) {
         if (uri == null) return null;
-        return uri.replace("bolt://", "").split(":")[0];
+        String s = uri.trim();
+        int scheme = s.indexOf("://");
+        if (scheme >= 0) s = s.substring(scheme + 3);
+        int at = s.lastIndexOf('@');          // strip user:pass@
+        if (at >= 0) s = s.substring(at + 1);
+        int slash = s.indexOf('/');           // strip any path
+        if (slash >= 0) s = s.substring(0, slash);
+        if (s.startsWith("[")) {              // bracketed IPv6 literal
+            int close = s.indexOf(']');
+            if (close > 0) return s.substring(1, close);
+        }
+        int colon = s.indexOf(':');           // strip :port
+        if (colon >= 0) s = s.substring(0, colon);
+        return s.isEmpty() ? null : s;
     }
 }

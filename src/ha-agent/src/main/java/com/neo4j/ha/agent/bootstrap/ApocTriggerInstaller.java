@@ -129,10 +129,15 @@ public class ApocTriggerInstaller {
     // the downstream `DeleteEventCapture.parseJsonList(...)` contract is
     // preserved bit-for-bit, and make `cdc-timestamp-assigned` skip this
     // key so trigger-side SETs do not chain-fire.
+    // REVIEW-H2: `_HealthCheck` is the L4 write probe's sentinel
+    // (Neo4jHealthChecker.WRITE_PROBE_LABEL). It is created and deleted inside
+    // one transaction every healthCheck.interval (2 s by default) on the
+    // primary, so stamping it is pure write amplification on a node that never
+    // survives its own transaction.
     private static final String TIMESTAMP_CREATED_TRIGGER = """
         CALL apoc.trigger.install($db, 'cdc-timestamp-created',
           'UNWIND $createdNodes AS n
-           WITH n WHERE NOT n:_CDCDeleteEvent
+           WITH n WHERE NOT n:_CDCDeleteEvent AND NOT n:_HealthCheck
            SET n._created_at = timestamp(),
                n._updated_at = timestamp(),
                n._elementId  = coalesce(n._elementId, elementId(n)),
@@ -462,8 +467,10 @@ public class ApocTriggerInstaller {
                 size([x IN coalesce($removedLabels["_CDCDeleteEvent"], [])
                       WHERE elementId(x) = dnEid]) AS isCdcEvt,
                 size([x IN coalesce($removedLabels["_TriggerReadinessProbe"], [])
-                      WHERE elementId(x) = dnEid]) AS isProbe
-           WHERE isCdcEvt = 0 AND isProbe = 0
+                      WHERE elementId(x) = dnEid]) AS isProbe,
+                size([x IN coalesce($removedLabels["_HealthCheck"], [])
+                      WHERE elementId(x) = dnEid]) AS isHealthProbe
+           WHERE isCdcEvt = 0 AND isProbe = 0 AND isHealthProbe = 0
            WITH dnEid,
                 head([e IN coalesce($removedNodeProperties["_elementId"], [])
                       WHERE elementId(e.node) = dnEid | e.old]) AS dnEidProp,
@@ -633,12 +640,31 @@ public class ApocTriggerInstaller {
         // name if still present from a pre-fix install (best-effort; the
         // drop inside installWithRetry only cleans the new names).
         dropLegacyTrigger(driver, database, "cdc-timestamp");
-        installWithRetry(driver, database, "cdc-timestamp-created",  TIMESTAMP_CREATED_TRIGGER);
-        installWithRetry(driver, database, "cdc-timestamp-assigned", TIMESTAMP_ASSIGNED_TRIGGER);
-        installWithRetry(driver, database, "cdc-timestamp-removed",  TIMESTAMP_REMOVED_TRIGGER);
-        installWithRetry(driver, database, "cdc-rel-timestamp", REL_TIMESTAMP_TRIGGER);
-        installWithRetry(driver, database, "cdc-capture-node-deletes", NODE_DELETE_TRIGGER);
-        installWithRetry(driver, database, "cdc-capture-rel-deletes", REL_DELETE_TRIGGER);
+        boolean nodeTriggersChanged =
+            installWithRetry(driver, database, "cdc-timestamp-created",  TIMESTAMP_CREATED_TRIGGER)
+          | installWithRetry(driver, database, "cdc-timestamp-assigned", TIMESTAMP_ASSIGNED_TRIGGER)
+          | installWithRetry(driver, database, "cdc-timestamp-removed",  TIMESTAMP_REMOVED_TRIGGER)
+          | installWithRetry(driver, database, "cdc-capture-node-deletes", NODE_DELETE_TRIGGER);
+        boolean relTriggersChanged =
+            installWithRetry(driver, database, "cdc-rel-timestamp", REL_TIMESTAMP_TRIGGER)
+          | installWithRetry(driver, database, "cdc-capture-rel-deletes", REL_DELETE_TRIGGER);
+
+        // REVIEW-B2: the readiness probes exist solely to close the window
+        // between "apoc.trigger.install returned" and "the trigger is actually
+        // armed on the target database" (APOC acks as soon as the system-DB row
+        // is written; arming waits for the next cache refresh). If NOTHING was
+        // installed or reinstalled, that window does not exist and the probes
+        // are pure cost — and they are expensive in exactly the worst place:
+        // both run inside the globally write-blocked Phase 5, the node probe for
+        // up to 10 s, the rel probe for up to 30 s PLUS an unconditional 1.2 s
+        // sleep. A switchover therefore always paid at least ~1.2 s, and up to
+        // ~41 s here, against a comment that advertised "~1-2 s" of write block.
+        if (!nodeTriggersChanged && !relTriggersChanged) {
+            log.info("All 6 APOC triggers already current on '{}' — skipping readiness probes "
+                + "(REVIEW-B2: nothing was reinstalled, so there is no arming window to wait for)",
+                database);
+            return;
+        }
         waitForTriggerArmed(driver, database);
         // BUG-058: cdc-rel-timestamp runs in phase:'afterAsync'. APOC installs
         // async triggers through a periodic refresh; `apoc.trigger.install`
@@ -649,7 +675,12 @@ public class ApocTriggerInstaller {
         // invisible to CDC keyset polling, and turns into an orphan on the
         // local primary (never publishes to Stream, never reaches other
         // standbys).
-        waitForRelTriggerArmed(driver, database);
+        if (relTriggersChanged) {
+            waitForRelTriggerArmed(driver, database);
+        } else {
+            log.info("Rel triggers unchanged on '{}' — skipping the 30s afterAsync arming probe "
+                + "(REVIEW-B2)", database);
+        }
         log.info("All 6 APOC triggers ensured AND armed on database '{}' " +
             "(node created/assigned/removed + rel timestamp + node/rel delete)", database);
     }
@@ -958,6 +989,24 @@ public class ApocTriggerInstaller {
      *         and continue — draining is best-effort, not a hard failure).
      */
     public static boolean drainRelTriggerAfterAsync(Driver driver, String database) {
+        // REVIEW-R1: there is nothing to drain if the trigger that feeds the
+        // afterAsync queue is not installed — and worse, the probe CANNOT
+        // succeed in that state: it creates a sentinel relationship and waits
+        // for `_updated_at` to appear, which only the trigger would ever write.
+        // So it burned the full REL_PROBE_TIMEOUT_MS (30 s) and returned false,
+        // which callers then read as "the drain failed":
+        //   * switchover Phase 2.6 logged a spurious "naked rels may result"
+        //     WARN and added 30 s to the cluster-wide write block;
+        //   * ApocTriggerUninstaller folded it into its return value, so
+        //     OldPrimaryRecovery treated it as "uninstall failed" and ABORTED
+        //     the recovery — a node whose triggers were already cleaned up
+        //     (failover Phase 9 succeeded) could therefore never rejoin.
+        if (!isTriggerInstalled(driver, database, "cdc-rel-timestamp")) {
+            log.info("drainRelTriggerAfterAsync: trigger 'cdc-rel-timestamp' is not installed on "
+                + "'{}' — nothing to drain (REVIEW-R1: probing here could only ever time out)",
+                database);
+            return true;
+        }
         long deadline = System.currentTimeMillis() + REL_PROBE_TIMEOUT_MS;
         int attempts = 0;
         String lastEid = null;
@@ -1060,12 +1109,12 @@ public class ApocTriggerInstaller {
      * {@code CALL apoc.trigger.install($db, $name, $body, ...)} invocation.
      * We re-parse it here to extract the expected body for comparison.</p>
      */
-    private void installWithRetry(Driver driver, String database, String name, String installCypher) {
+    private boolean installWithRetry(Driver driver, String database, String name, String installCypher) {
         // Extract the expected body from the install cypher's second
         // positional argument (between the first and second single-quote).
         // If extraction fails we fall through to unconditional install
         // (safe, just not optimised).
-        String expectedBody = extractTriggerBody(installCypher);
+        String expectedBody = extractTriggerBodyV2(installCypher);
 
         // Check if the currently-installed trigger already matches expectedBody.
         // apoc.trigger.show is a READ on system DB (no leader-write required),
@@ -1075,7 +1124,7 @@ public class ApocTriggerInstaller {
         if (expectedBody != null && isTriggerAlreadyCurrent(driver, database, name, expectedBody)) {
             log.info("APOC trigger '{}' already current on database '{}' (skipping reinstall)",
                 name, database);
-            return;
+            return false;
         }
 
         // Need to write system DB. Drop any existing trigger with this name
@@ -1095,7 +1144,7 @@ public class ApocTriggerInstaller {
             try (Session session = driver.session(SessionConfig.forDatabase("system"))) {
                 session.run(installCypher, Map.of("db", database)).consume();
                 log.info("APOC trigger '{}' installed on attempt {}", name, attempt);
-                return;
+                return true;
             } catch (Exception e) {
                 lastException = e;
                 if (e.getMessage() != null && e.getMessage().contains("already installed")) {
@@ -1139,13 +1188,34 @@ public class ApocTriggerInstaller {
      */
     private boolean isTriggerAlreadyCurrent(Driver driver, String database, String name, String expectedBody) {
         try (Session session = driver.session(SessionConfig.forDatabase("system"))) {
+            // REVIEW-B4: filter in Java, NOT in Cypher.
+            //
+            // This used to be `CALL apoc.trigger.show($db) YIELD name AS tn, query AS q
+            // WHERE tn = $name RETURN q AS body`. The system database accepts only
+            // CALL / YIELD / RETURN — a WHERE after YIELD is rejected with
+            // "The following unsupported clauses were used: WITH". The exception was
+            // swallowed by the catch below, so this method ALWAYS returned false and
+            // the "skip reinstall when unchanged" fast path never once ran.
+            //
+            // Consequences, both observed on the HK cluster: every ensureInstalled
+            // dropped and reinstalled all six triggers — including the call inside
+            // switchover Phase 5, which opens a window on the NEW primary where the
+            // triggers are dropped but not yet reinstalled, and any write committing
+            // in that window is never stamped and never seen by CDC. It also forced
+            // the full readiness-probe cost on every single call.
+            String installedBody = null;
             var result = session.run(
-                "CALL apoc.trigger.show($db) YIELD name AS tn, query AS q " +
-                "WHERE tn = $name RETURN q AS body",
-                Map.of("db", database, "name", name)
+                "CALL apoc.trigger.show($db) YIELD name, query RETURN name, query",
+                Map.of("db", database)
             );
-            if (!result.hasNext()) return false;
-            String installedBody = result.single().get("body").asString();
+            while (result.hasNext()) {
+                var rec = result.next();
+                if (name.equals(rec.get("name").asString())) {
+                    installedBody = rec.get("query").asString();
+                    break;
+                }
+            }
+            if (installedBody == null) return false;
             String a = normaliseCypher(installedBody);
             String b = normaliseCypher(expectedBody);
             boolean match = a.equals(b);
@@ -1171,28 +1241,57 @@ public class ApocTriggerInstaller {
      * Returns the raw body string (without the wrapping quotes), or
      * {@code null} if parsing fails.
      */
-    private static String extractTriggerBody(String installCypher) {
-        // Find the first single quote after "install(" and track balanced
-        // quotes. The body starts at the THIRD single quote (after $db
-        // placeholder = first quote pair around trigger name, actually we
-        // start after "install(" — first single quote is opening of name,
-        // then closing, then opening of body, then closing of body).
+    /**
+     * Is {@code name} currently installed on {@code database}? Returns true on
+     * any error so the caller takes the conservative path (run the probe),
+     * which costs latency but never correctness.
+     */
+    public static boolean isTriggerInstalled(Driver driver, String database, String name) {
+        try (Session session = driver.session(SessionConfig.forDatabase("system"))) {
+            // NB: filter in Java — the system DB rejects WHERE after YIELD
+            // (see REVIEW-B4 in isTriggerAlreadyCurrent).
+            var result = session.run("CALL apoc.trigger.show($db) YIELD name RETURN name",
+                Map.of("db", database));
+            while (result.hasNext()) {
+                if (name.equals(result.next().get("name").asString())) return true;
+            }
+            return false;
+        } catch (Exception e) {
+            log.debug("Could not list APOC triggers on '{}' ({}); assuming '{}' is installed",
+                database, e.getMessage(), name);
+            return true;
+        }
+    }
+
+    static String extractTriggerBodyV2(String installCypher) {
+        if (installCypher == null) return null;
         int start = installCypher.indexOf("install(");
         if (start < 0) return null;
-        // Quote 1: open of name, Quote 2: close of name, Quote 3: open of body,
-        // Quote 4: close of body. We want the substring between 3 and 4.
-        int q = 0; int bodyStart = -1; int bodyEnd = -1;
-        for (int i = start; i < installCypher.length(); i++) {
-            char c = installCypher.charAt(i);
-            if (c == '\'') {
-                q++;
-                if (q == 3) bodyStart = i + 1;
-                else if (q == 4) { bodyEnd = i; break; }
+
+        // Scan single-quoted literals, honouring backslash escapes. The install
+        // call is `apoc.trigger.install($db, '<name>', '<body>', {phase: '...'})`
+        // so the body is literal #1 (0-based).
+        int literalIndex = -1;
+        int i = start;
+        int n = installCypher.length();
+        while (i < n) {
+            if (installCypher.charAt(i) != '\'') { i++; continue; }
+            int from = i + 1;
+            int j = from;
+            while (j < n) {
+                char c = installCypher.charAt(j);
+                if (c == '\\' && j + 1 < n) { j += 2; continue; }
+                if (c == '\'') break;
+                j++;
             }
+            if (j >= n) return null;              // unterminated literal
+            literalIndex++;
+            if (literalIndex == 1) return installCypher.substring(from, j);
+            i = j + 1;
         }
-        if (bodyStart < 0 || bodyEnd < 0 || bodyEnd <= bodyStart) return null;
-        return installCypher.substring(bodyStart, bodyEnd);
+        return null;
     }
+
 
     /**
      * Normalise a cypher string for comparison: collapse runs of whitespace

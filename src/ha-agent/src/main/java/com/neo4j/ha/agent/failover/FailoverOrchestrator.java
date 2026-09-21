@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class FailoverOrchestrator {
 
@@ -54,6 +55,35 @@ public class FailoverOrchestrator {
     private final InflightTxDrainWaiter inflightTxDrainWaiter = new InflightTxDrainWaiter();
     private final AtomicLong lastFailoverTime = new AtomicLong(0);
     private final AtomicInteger failoverCountInHour = new AtomicInteger(0);
+
+    /**
+     * REVIEW-F2: the ONLY mutual exclusion for role changes used to live in
+     * {@code HaAgent} (an {@code AtomicBoolean} + single-thread executor) and
+     * covered just the health-checker path. Every admin HTTP endpoint spawned a
+     * raw {@code new Thread(...)} straight into {@link #executeFailover} /
+     * {@link #executeSwitchover}, so two concurrent switchovers — or a manual
+     * switchover racing an automatic failover — would double-increment the
+     * fencing token, interleave blockWrites/unblockWrites, race
+     * {@code cdcCollector.switchTarget} and leave {@code clusterState.primary}
+     * disagreeing with what CDC is actually polling.
+     *
+     * <p>Mutual exclusion now lives here, where every entry point passes
+     * through. Requests that arrive while a switch is running are REFUSED
+     * (not queued): queuing a stale "fail over node-01" behind a switchover
+     * that already moved off node-01 is never what the operator wanted.</p>
+     */
+    private final ReentrantLock switchLock = new ReentrantLock();
+    private volatile String activeOperation;
+
+    /** True while a failover or switchover holds the switch lock. */
+    public boolean isSwitchInProgress() {
+        return switchLock.isLocked();
+    }
+
+    /** Human-readable description of the running switch, or null. */
+    public String getActiveOperation() {
+        return activeOperation;
+    }
 
     public FailoverOrchestrator(HealthChecker healthChecker, FencingTokenManager fencingTokenManager,
                                  CdcCollector cdcCollector, SyncApplier syncApplier,
@@ -89,23 +119,43 @@ public class FailoverOrchestrator {
         this.backupCoordinator = backupCoordinator;
     }
 
-    public void executeFailover(String failedNodeId) {
-        executeFailover(failedNodeId, true);
+    public boolean executeFailover(String failedNodeId) {
+        return executeFailover(failedNodeId, true);
     }
 
     /**
      * @param auto true for automatic failover triggered by health checker — subject to rate
      *             limits (min interval + hourly cap). Manual invocations should pass false
      *             so urgent operator intervention is never blocked (M10).
+     * @return true if the failover ran to completion of its attempt (success or
+     *         handled failure); false if it was refused up-front (rate limit or
+     *         REVIEW-F2 concurrent-switch guard).
      */
-    public void executeFailover(String failedNodeId, boolean auto) {
+    public boolean executeFailover(String failedNodeId, boolean auto) {
+        // REVIEW-F2: refuse rather than run a second switch concurrently.
+        if (!switchLock.tryLock()) {
+            metrics.switchoverRejectedConcurrentTotal.increment();
+            log.warn("Failover for {} REFUSED: {} already in progress", failedNodeId, activeOperation);
+            audit.logCancel(failedNodeId, "Refused: " + activeOperation + " already in progress");
+            return false;
+        }
+        activeOperation = (auto ? "auto-failover(" : "manual-failover(") + failedNodeId + ")";
+        try {
+            return doExecuteFailover(failedNodeId, auto);
+        } finally {
+            activeOperation = null;
+            switchLock.unlock();
+        }
+    }
+
+    private boolean doExecuteFailover(String failedNodeId, boolean auto) {
         long startTime = System.currentTimeMillis();
         audit.logStart(failedNodeId);
 
         // Rate limits only apply to automatic failovers (design §11 "最大自动切换次数")
         if (auto && !checkSafeToFailover()) {
             audit.logCancel(failedNodeId, "Safety check failed (rate limit)");
-            return;
+            return false;
         }
 
         try {
@@ -115,7 +165,7 @@ public class FailoverOrchestrator {
             if (healthChecker.isHealthy(failedNodeId)) {
                 audit.logCancel(failedNodeId, "Node recovered during confirmation");
                 log.info("Failover cancelled: node {} recovered", failedNodeId);
-                return;
+                return false;
             }
 
             // BUG-049: pause the periodic HAProxy state reconciler for the duration of
@@ -125,6 +175,7 @@ public class FailoverOrchestrator {
             // state ready` — undoing Phase 2 blockWrites and allowing ~600 orphan
             // writes to land on OLD during the CDC re-wiring window.
             runSwitchoverSteps(() -> doFailoverPhases2to10(failedNodeId, startTime, auto));
+            return true;
         } catch (Throwable t) {
             // Catch Throwable, not Exception: a NoSuchMethodError / NoClassDefFoundError
             // (version-skew between modules) or OutOfMemoryError / StackOverflowError
@@ -134,7 +185,103 @@ public class FailoverOrchestrator {
             metrics.recordFailover(false, duration);
             audit.logFailed(failedNodeId, t instanceof Exception ex ? ex : new RuntimeException(t));
             log.error("Failover FAILED for node {}", failedNodeId, t);
+            return true;
         }
+    }
+
+    /**
+     * REVIEW-F1: how far a switch got before it threw. The switch blocks ALL
+     * writes as its first step (BUG-044) and only unblocks them as its last
+     * step; every path in between used to be "log the exception and walk away",
+     * leaving HAProxy with every server in maint and nothing in the system that
+     * would ever undo it. Two different bad endings were possible:
+     *
+     * <ul>
+     *   <li>the reconciler (resumed by {@code runSwitchoverSteps}' finally) sees
+     *       a still-HEALTHY old primary and revives it — but CDC was already
+     *       stopped, so those writes are never captured: silent data loss, i.e.
+     *       exactly the orphan-write class BUG-042/048 closed; or</li>
+     *   <li>the old primary is not HEALTHY, the reconciler's BUG-069 guard
+     *       correctly declines to revive it, and the cluster stays permanently
+     *       read-only with no retry (onNodeDown only fires on a state edge,
+     *       and lastFailoverTime is only bumped on success).</li>
+     * </ul>
+     *
+     * <p>The rollback decision is driven by <b>where CDC is pointing</b>, which
+     * is the only thing that makes unblocking safe:</p>
+     * <pre>
+     *   !cdcStopped      -> nothing was torn down; unblock OLD (pure no-op rollback)
+     *   cdcRetargeted    -> CDC is live on NEW; unblock NEW (finish the switch)
+     *   in between       -> CDC is stopped and pointing nowhere. Try to restore it
+     *                       on OLD and unblock OLD; if that fails, KEEP WRITES
+     *                       BLOCKED on purpose and alert — a read-only cluster is
+     *                       recoverable, uncaptured writes are not.
+     * </pre>
+     */
+    private static final class SwitchProgress {
+        boolean writesBlocked;
+        boolean cdcStopped;
+        boolean cdcRetargeted;
+        boolean writesUnblocked;
+        String oldPrimaryNodeId;
+        String oldPrimaryServer;
+        String newPrimaryServer;
+    }
+
+    /**
+     * Restores a writable cluster after an aborted switch, or deliberately
+     * leaves it blocked when no safe target exists. See {@link SwitchProgress}.
+     */
+    private void restoreWritesIfNeeded(SwitchProgress p) {
+        if (p == null || !p.writesBlocked || p.writesUnblocked) return;
+
+        if (p.cdcRetargeted && p.newPrimaryServer != null) {
+            log.error("REVIEW-F1 rollback: switch aborted AFTER CDC moved to the new primary; "
+                + "unblocking writes on {} so the cluster does not stay read-only", p.newPrimaryServer);
+            haProxyUpdater.unblockWrites(p.newPrimaryServer);
+            p.writesUnblocked = true;
+            metrics.switchoverRolledBackTotal.increment();
+            return;
+        }
+
+        if (!p.cdcStopped && p.oldPrimaryServer != null) {
+            log.error("REVIEW-F1 rollback: switch aborted BEFORE CDC was stopped; "
+                + "nothing was torn down, restoring writes on OLD primary {}", p.oldPrimaryServer);
+            haProxyUpdater.unblockWrites(p.oldPrimaryServer);
+            p.writesUnblocked = true;
+            metrics.switchoverRolledBackTotal.increment();
+            return;
+        }
+
+        // CDC stopped but never re-pointed. Unblocking anything now would accept
+        // writes nobody is capturing, so first try to put CDC back on OLD.
+        try {
+            Driver oldDriver = p.oldPrimaryNodeId != null
+                ? clusterState.getDriver(p.oldPrimaryNodeId) : null;
+            if (oldDriver != null && healthChecker.isHealthy(p.oldPrimaryNodeId)
+                    && p.oldPrimaryServer != null) {
+                long token = fencingTokenManager.getCurrentToken();
+                cdcCollector.switchTarget(oldDriver, p.oldPrimaryNodeId, token);
+                syncApplier.start(clusterState.getStandbyDrivers(), database, token);
+                haProxyUpdater.unblockWrites(p.oldPrimaryServer);
+                p.writesUnblocked = true;
+                metrics.switchoverRolledBackTotal.increment();
+                log.error("REVIEW-F1 rollback: switch aborted mid-flight; CDC restored on OLD "
+                    + "primary {} (token {}) and writes unblocked — cluster is back to the "
+                    + "pre-switch topology", p.oldPrimaryNodeId, token);
+                return;
+            }
+        } catch (Exception e) {
+            log.error("REVIEW-F1 rollback: could not restore CDC on OLD primary {}: {}",
+                p.oldPrimaryNodeId, e.toString(), e);
+        }
+
+        metrics.switchoverStrandedBlockedTotal.increment();
+        log.error("REVIEW-F1: switch aborted with CDC stopped and no safe target — "
+            + "WRITES DELIBERATELY LEFT BLOCKED. Unblocking now would accept writes that "
+            + "no CDC is capturing (silent data loss). The cluster is READ-ONLY until an "
+            + "operator runs POST /cluster/switchover (or /cluster/failover) onto a healthy "
+            + "standby. Alert on neo4j_ha_switchover_stranded_blocked_total.");
     }
 
     /** Common wrapper that pauses/resumes the HAProxy state reconciler. BUG-049. */
@@ -152,6 +299,8 @@ public class FailoverOrchestrator {
     }
 
     private void doFailoverPhases2to10(String failedNodeId, long startTime, boolean auto) {
+        SwitchProgress progress = new SwitchProgress();
+        progress.oldPrimaryNodeId = failedNodeId;
         try {
             // Phase 2 (BUG-044 + BUG-048): WRITE BLOCK FIRST.
             //
@@ -179,6 +328,8 @@ public class FailoverOrchestrator {
                 }
             }
             haProxyUpdater.blockWrites(oldPrimaryServer, allStandbyServers);
+            progress.writesBlocked = true;
+            progress.oldPrimaryServer = oldPrimaryServer;
             log.info("Phase 2: Write backend BLOCKED (newPrimary={} will unblock at the end)",
                 newPrimary);
 
@@ -238,6 +389,7 @@ public class FailoverOrchestrator {
                 backupCoordinator.cancelForFailover();
             }
             cdcCollector.stop();
+            progress.cdcStopped = true;
             syncApplier.stop();
             syncApplier.drainPending();
 
@@ -293,7 +445,8 @@ public class FailoverOrchestrator {
             log.info("Phase 5: Selected new primary: {}", newPrimary);
             Driver newPrimaryDriver = clusterState.getDriver(newPrimary);
             triggerInstaller.ensureInstalled(newPrimaryDriver, database);
-            indexInstaller.ensureIndexes(newPrimaryDriver, database);
+            // REVIEW-B1: no data scan while the whole cluster is write-blocked.
+            indexInstaller.ensureIndexes(newPrimaryDriver, database, false);
             // Copy CDC checkpoint from the failed primary to the new primary (M7/BUG-027)
             checkpointManager.copyCdcCheckpoint(failedNodeId, newPrimary);
             log.info("Phase 5: NEW primary {} prepared (triggers, indexes, checkpoint)", newPrimary);
@@ -302,6 +455,8 @@ public class FailoverOrchestrator {
             // against the NEW primary but nothing is writing there yet (write backend
             // still blocked).
             cdcCollector.switchTarget(newPrimaryDriver, newPrimary, newToken);
+            progress.cdcRetargeted = true;
+            progress.newPrimaryServer = newPrimaryServer;
             log.info("Phase 6: CDC switched to NEW primary");
 
             // Phase 7: Update cluster state
@@ -323,6 +478,7 @@ public class FailoverOrchestrator {
             // is the atomic cut-over instant; from here on client writes succeed on the
             // NEW primary and are captured by its Triggers + CDC pipeline.
             haProxyUpdater.unblockWrites(newPrimaryServer);
+            progress.writesUnblocked = true;
             log.info("Phase 10: Write backend UNBLOCKED on {}", newPrimaryServer);
 
             long duration = System.currentTimeMillis() - startTime;
@@ -337,10 +493,35 @@ public class FailoverOrchestrator {
             metrics.recordFailover(false, duration);
             audit.logFailed(failedNodeId, t instanceof Exception ex ? ex : new RuntimeException(t));
             log.error("Failover FAILED for node {}", failedNodeId, t);
+        } finally {
+            // REVIEW-F1: never leave HAProxy in "all maint" with nobody to undo it.
+            restoreWritesIfNeeded(progress);
         }
     }
 
-    public void executeSwitchover(String targetNodeId) {
+    /**
+     * @return true if the switchover attempt ran; false if refused because another
+     *         failover/switchover was already in flight (REVIEW-F2).
+     */
+    public boolean executeSwitchover(String targetNodeId) {
+        if (!switchLock.tryLock()) {
+            metrics.switchoverRejectedConcurrentTotal.increment();
+            log.warn("Switchover to {} REFUSED: {} already in progress", targetNodeId, activeOperation);
+            audit.logCancel(clusterState.getPrimaryNodeId(),
+                "Refused: " + activeOperation + " already in progress");
+            return false;
+        }
+        activeOperation = "switchover(" + (targetNodeId == null ? "auto" : targetNodeId) + ")";
+        try {
+            doExecuteSwitchover(targetNodeId);
+            return true;
+        } finally {
+            activeOperation = null;
+            switchLock.unlock();
+        }
+    }
+
+    private void doExecuteSwitchover(String targetNodeId) {
         String currentPrimary = clusterState.getPrimaryNodeId();
         long startTime = System.currentTimeMillis();
         audit.logStart(currentPrimary);
@@ -375,6 +556,8 @@ public class FailoverOrchestrator {
     }
 
     private void doSwitchoverPhases(String currentPrimary, String newPrimary, long startTime) {
+        SwitchProgress progress = new SwitchProgress();
+        progress.oldPrimaryNodeId = currentPrimary;
         try {
             // BUG-044 + BUG-048: WRITE BLOCK FIRST.
             // Put every server in the write backend into maint and kill existing
@@ -392,6 +575,8 @@ public class FailoverOrchestrator {
                 }
             }
             haProxyUpdater.blockWrites(oldPrimaryServer, allOtherServers);
+            progress.writesBlocked = true;
+            progress.oldPrimaryServer = oldPrimaryServer;
             log.info("Switchover: write backend BLOCKED; {} -> {} beginning", currentPrimary, newPrimary);
 
             // Phase 2.5 (BUG-056): Wait for in-flight Neo4j write tx on OLD to
@@ -441,6 +626,7 @@ public class FailoverOrchestrator {
                 backupCoordinator.cancelForFailover();
             }
             cdcCollector.stop();
+            progress.cdcStopped = true;
             syncApplier.stop();
             syncApplier.drainPending();
 
@@ -483,7 +669,8 @@ public class FailoverOrchestrator {
             // are globally blocked, this happens on a quiescent cluster.
             Driver newPrimaryDriver = clusterState.getDriver(newPrimary);
             triggerInstaller.ensureInstalled(newPrimaryDriver, database);
-            indexInstaller.ensureIndexes(newPrimaryDriver, database);
+            // REVIEW-B1: no data scan while the whole cluster is write-blocked.
+            indexInstaller.ensureIndexes(newPrimaryDriver, database, false);
             // M7 / BUG-027: preserve CDC cursor across switchover.
             checkpointManager.copyCdcCheckpoint(currentPrimary, newPrimary);
 
@@ -491,6 +678,8 @@ public class FailoverOrchestrator {
             // loop is now live against the NEW primary but nothing has written there
             // yet — it is idle, waiting for the write unblock.
             cdcCollector.switchTarget(newPrimaryDriver, newPrimary, newToken);
+            progress.cdcRetargeted = true;
+            progress.newPrimaryServer = newPrimaryServer;
 
             nodeRegistry.updateRole(newPrimary, NodeRole.PRIMARY);
             nodeRegistry.updateRole(currentPrimary, NodeRole.STANDBY);
@@ -589,6 +778,7 @@ public class FailoverOrchestrator {
 
             // BUG-044: WRITE UNBLOCK. Atomic cut-over instant: writes resume on NEW.
             haProxyUpdater.unblockWrites(newPrimaryServer);
+            progress.writesUnblocked = true;
             log.info("Switchover: write backend UNBLOCKED on {}", newPrimaryServer);
 
             long duration = System.currentTimeMillis() - startTime;
@@ -602,6 +792,9 @@ public class FailoverOrchestrator {
             metrics.recordFailover(false, duration);
             audit.logFailed(currentPrimary, t instanceof Exception ex ? ex : new RuntimeException(t));
             log.error("Switchover FAILED from {}", currentPrimary, t);
+        } finally {
+            // REVIEW-F1: never leave HAProxy in "all maint" with nobody to undo it.
+            restoreWritesIfNeeded(progress);
         }
     }
 

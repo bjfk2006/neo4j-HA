@@ -65,6 +65,12 @@ public class StreamMaintenanceTask implements Runnable {
     private final HaMetrics metrics;
     private ScheduledExecutorService scheduler;
 
+    /**
+     * REVIEW-C11: set once when the server rejects XTRIM MINID (Redis &lt; 6.2),
+     * so the failure is reported a single time instead of every interval.
+     */
+    private volatile boolean minIdUnsupported = false;
+
     /** Single-stream convenience constructor. */
     public StreamMaintenanceTask(JedisPool jedisPool, String streamKey,
                                   long intervalMs, long safetyWindowMs,
@@ -171,6 +177,23 @@ public class StreamMaintenanceTask implements Runnable {
 
             StreamEntryID clusterOldestNeeded = null;
             for (StreamGroupFullInfo group : groups) {
+                // REVIEW-C8: a consumer group left behind by a standby that was
+                // permanently removed from the cluster keeps its lastDeliveredId
+                // frozen forever. Because the cutoff is the MINIMUM across all
+                // groups, that one dead group pins retention at its last position
+                // and the stream grows until XADD's MAXLEN (1e6) starts dropping
+                // entries — which is precisely the consumer-unaware trimming this
+                // task exists to avoid. Groups that are both idle beyond the
+                // abandonment threshold and have nothing pending are ignored for
+                // the cutoff computation (they are never deleted here; that stays
+                // an operator decision).
+                if (isAbandonedGroup(group)) {
+                    log.warn("Stream maintenance: ignoring abandoned consumer group '{}' on {} "
+                        + "for retention (no consumers / all idle > {}ms, PEL empty). "
+                        + "Delete it with XGROUP DESTROY once the node is decommissioned.",
+                        group.getName(), streamKey, ABANDONED_GROUP_IDLE_MS);
+                    continue;
+                }
                 StreamEntryID groupOldest = oldestNeededForGroup(group);
                 if (groupOldest == null) continue;
                 if (clusterOldestNeeded == null
@@ -191,8 +214,34 @@ public class StreamMaintenanceTask implements Runnable {
             }
             StreamEntryID cutoff = new StreamEntryID(cutoffMs, 0);
 
-            long trimmed = jedis.xtrim(streamKey,
-                    XTrimParams.xTrimParams().minId(cutoff.toString()).approximateTrimming());
+            if (minIdUnsupported) return -1L;
+
+            long trimmed;
+            try {
+                trimmed = jedis.xtrim(streamKey,
+                        XTrimParams.xTrimParams().minId(cutoff.toString()).approximateTrimming());
+            } catch (redis.clients.jedis.exceptions.JedisDataException e) {
+                // REVIEW-C11 (found while verifying on the HK cluster): XTRIM MINID
+                // was added in Redis 6.2. On an older server the command is rejected
+                // with a bare "ERR syntax error", which this task logged once per
+                // interval forever while silently never trimming anything. The whole
+                // point of BUG-038 — consumer-aware retention, so a lagging standby's
+                // PEL can never be trimmed out from under it — was therefore inactive,
+                // with XADD's MAXLEN (a consumer-AGNOSTIC cap) as the only retention.
+                // Detect it once, say so loudly and actionably, then stop retrying.
+                String msg = e.getMessage() == null ? "" : e.getMessage();
+                if (msg.contains("syntax error")) {
+                    minIdUnsupported = true;
+                    log.error("XTRIM MINID rejected by this Redis ({}). MINID requires Redis 6.2+; "
+                        + "consumer-aware stream retention is DISABLED and the only bound on {} "
+                        + "is XADD's MAXLEN, which can drop entries a lagging standby still has "
+                        + "in its PEL (BUG-038). Upgrade Redis to >= 6.2, or size stream.maxLen "
+                        + "to cover the worst tolerated standby lag. This message is logged once.",
+                        msg, streamKey);
+                    return -1L;
+                }
+                throw e;
+            }
 
             if (metrics != null) {
                 metrics.streamRetentionCutoffMs.set(cutoffMs);
@@ -216,6 +265,46 @@ public class StreamMaintenanceTask implements Runnable {
      * For a healthy group with empty PEL this is {@code lastDeliveredId}; for a group
      * that has in-flight (delivered but unACK'd) messages it is the minimum PEL id.
      */
+    /**
+     * A group counts as abandoned when it has no live consumer activity for
+     * {@link #ABANDONED_GROUP_IDLE_MS} AND holds nothing in any PEL. The PEL
+     * condition is the safety interlock: a group with unacked entries is still
+     * owed data, however long it has been quiet, so it always pins retention.
+     */
+    static final long ABANDONED_GROUP_IDLE_MS = 24L * 60 * 60 * 1000; // 24h
+
+    private boolean isAbandonedGroup(StreamGroupFullInfo group) {
+        List<StreamConsumerFullInfo> consumers = group.getConsumers();
+        if (consumers == null || consumers.isEmpty()) return true;
+        for (StreamConsumerFullInfo c : consumers) {
+            var pending = c.getPending();
+            if (pending != null && !pending.isEmpty()) return false; // still owed data
+        }
+        for (StreamConsumerFullInfo c : consumers) {
+            Long seen = consumerIdleMs(c);
+            if (seen == null || seen < ABANDONED_GROUP_IDLE_MS) return false;
+        }
+        return true;
+    }
+
+    /** Best-effort idle time for a consumer across Jedis shapes. */
+    private static Long consumerIdleMs(StreamConsumerFullInfo c) {
+        for (String getter : new String[]{"getSeenTime", "getInactive", "getIdle"}) {
+            try {
+                var m = c.getClass().getMethod(getter);
+                Object v = m.invoke(c);
+                if (v instanceof Number num) {
+                    long raw = num.longValue();
+                    // seen-time is an absolute epoch ms; idle/inactive are deltas.
+                    return "getSeenTime".equals(getter)
+                        ? Math.max(0L, System.currentTimeMillis() - raw)
+                        : raw;
+                }
+            } catch (Exception ignored) { /* try next shape */ }
+        }
+        return null;
+    }
+
     private StreamEntryID oldestNeededForGroup(StreamGroupFullInfo group) {
         StreamEntryID lastDelivered = group.getLastDeliveredId();
         StreamEntryID oldestInPel = null;

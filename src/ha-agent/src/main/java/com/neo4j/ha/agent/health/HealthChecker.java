@@ -34,6 +34,23 @@ public class HealthChecker {
     private final Map<String, Integer> successCounts = new ConcurrentHashMap<>();
 
     /**
+     * REVIEW-H4: consecutive probe rounds in which the node was not fully
+     * healthy, <b>regardless of which layer failed</b>. Reset only by an
+     * all-green round.
+     *
+     * <p>The per-layer counters cannot carry this job because each failure
+     * branch zeroes the OTHER layers' counters: an L1/L2 failure clears
+     * {@code l3FailCounts}/{@code l4FailCounts}, and a successful L1/L2 clears
+     * {@code l12FailCounts}. A node that alternates between "TCP blip" and
+     * "Cypher error" therefore resets both counters on every round, neither one
+     * ever reaches its threshold, and the node sits in SUSPECT forever — so
+     * {@code onNodeDown} never fires and a flapping primary is never failed
+     * over. This counter makes the DOWN escalation immune to which layer is
+     * failing on any given round.</p>
+     */
+    private final Map<String, Integer> consecutiveFailures = new ConcurrentHashMap<>();
+
+    /**
      * Set of nodeIds whose health checks are temporarily suppressed (e.g. during
      * backup window where the container is intentionally stopped). Suppressed
      * nodes skip the probe entirely and never trigger onNodeDown/onNodeRecovered.
@@ -50,8 +67,34 @@ public class HealthChecker {
         void onNodeRecovered(String nodeId);
     }
 
+    /**
+     * REVIEW-H3: the user database used to be hardcoded to {@code "neo4j"}
+     * inside {@code checkNode}, ignoring {@code cluster.nodes[].neo4j.database}.
+     * On a deployment using any other database name the L3/L4 probes ran against
+     * a database that does not exist, so EVERY node was permanently UNHEALTHY —
+     * which in turn makes {@code StandbySelector.selectBest()} throw and failover
+     * impossible. Silent, total, and only visible on non-default deployments.
+     */
+    private final String database;
+
+    /**
+     * REVIEW-H1: probes run on a bounded worker so one wedged node cannot stall
+     * the whole health loop. Cached pool, one thread per node in practice.
+     */
+    private final ExecutorService probeExecutor = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "health-probe");
+        t.setDaemon(true);
+        return t;
+    });
+
     public HealthChecker(ClusterStateManager clusterState, Neo4jHealthChecker healthChecker,
                           HaMetrics metrics, HaConfig.FailoverConfig failoverConfig) {
+        this(clusterState, healthChecker, metrics, failoverConfig, "neo4j");
+    }
+
+    public HealthChecker(ClusterStateManager clusterState, Neo4jHealthChecker healthChecker,
+                          HaMetrics metrics, HaConfig.FailoverConfig failoverConfig,
+                          String database) {
         this.clusterState = clusterState;
         this.healthChecker = healthChecker;
         this.metrics = metrics;
@@ -59,6 +102,7 @@ public class HealthChecker {
         this.timeoutMs = (int) failoverConfig.healthCheck().timeoutMs();
         this.failThreshold = failoverConfig.healthCheck().failThreshold();
         this.successThreshold = failoverConfig.healthCheck().successThreshold();
+        this.database = (database == null || database.isBlank()) ? "neo4j" : database;
     }
 
     public void setListener(HealthChangeListener listener) {
@@ -73,6 +117,7 @@ public class HealthChecker {
             l3FailCounts.put(node.id(), 0);
             l4FailCounts.put(node.id(), 0);
             successCounts.put(node.id(), 0);
+            consecutiveFailures.put(node.id(), 0);
         }
 
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -88,6 +133,7 @@ public class HealthChecker {
         if (scheduler != null) {
             scheduler.shutdown();
         }
+        probeExecutor.shutdownNow();
     }
 
     private void checkAllNodes() {
@@ -103,51 +149,53 @@ public class HealthChecker {
         Driver driver = clusterState.getDriver(node.id());
         if (driver == null) return;
 
-        String database = "neo4j"; // default
-        boolean l1 = true, l2 = false, l3 = false, l4 = true;
-
-        try {
-            // L1: TCP
-            URI uri = URI.create(node.boltUri().replace("bolt://", "http://"));
-            l1 = healthChecker.checkTcp(uri.getHost(), uri.getPort() > 0 ? uri.getPort() : 7687, timeoutMs);
-
-            if (l1) {
-                // L2: Bolt
-                l2 = healthChecker.checkBolt(driver);
-
-                if (l2) {
-                    // L3: Cypher
-                    l3 = healthChecker.checkCypher(driver, database);
-                    // L4: Write check (primary only)
-                    if (l3 && node.role() == NodeRole.PRIMARY) {
-                        l4 = healthChecker.checkWrite(driver, database);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.debug("Health check error for node {}: {}", node.id(), e.getMessage());
-        }
+        Probe probe = runProbeWithBudget(node, driver);
+        boolean l1 = probe.l1, l2 = probe.l2, l3 = probe.l3, l4 = probe.l4;
 
         HealthState currentState = nodeStates.getOrDefault(node.id(), HealthState.HEALTHY);
 
         if (l1 && l2 && l3 && l4) {
-            successCounts.merge(node.id(), 1, Integer::sum);
+            int successes = successCounts.merge(node.id(), 1, Integer::sum);
             l12FailCounts.put(node.id(), 0);
             l3FailCounts.put(node.id(), 0);
             l4FailCounts.put(node.id(), 0);
+            consecutiveFailures.put(node.id(), 0);
 
-            if (currentState == HealthState.DOWN && successCounts.get(node.id()) >= successThreshold) {
+            if (currentState == HealthState.DOWN && successes >= successThreshold) {
                 nodeStates.put(node.id(), HealthState.HEALTHY);
                 clusterState.updateHealth(node.id(), NodeHealth.HEALTHY);
                 log.info("Node {} recovered (was DOWN)", node.id());
                 if (listener != null) listener.onNodeRecovered(node.id());
-            } else if (currentState != HealthState.HEALTHY && currentState != HealthState.DOWN) {
+            } else if (currentState != HealthState.HEALTHY && currentState != HealthState.DOWN
+                    && successes >= successThreshold) {
+                // REVIEW-H4: SUSPECT/UNHEALTHY → HEALTHY now also requires
+                // successThreshold consecutive good rounds. It used to flip back
+                // on the very first good probe while DOWN → HEALTHY required
+                // successThreshold, so a flapping node oscillated between
+                // SUSPECT and HEALTHY once per interval and never accumulated
+                // enough failures in a row to escalate.
                 nodeStates.put(node.id(), HealthState.HEALTHY);
                 clusterState.updateHealth(node.id(), NodeHealth.HEALTHY);
+                log.info("Node {} back to HEALTHY (was {}, {} consecutive successes)",
+                    node.id(), currentState, successes);
             }
         } else {
             successCounts.put(node.id(), 0);
             metrics.healthCheckFailures.increment();
+
+            // REVIEW-H4: layer-agnostic escalation. Counted before the per-layer
+            // branches below, none of which can reset it.
+            int consecutive = consecutiveFailures.merge(node.id(), 1, Integer::sum);
+            if (consecutive >= failThreshold * 2 && currentState != HealthState.DOWN) {
+                nodeStates.put(node.id(), HealthState.DOWN);
+                clusterState.updateHealth(node.id(), NodeHealth.DOWN);
+                log.error("{} {} is DOWN ({} consecutive unhealthy probes across mixed layers; "
+                        + "l1={} l2={} l3={} l4={})",
+                    node.role() == NodeRole.PRIMARY ? "Primary" : "Standby",
+                    node.id(), consecutive, l1, l2, l3, l4);
+                if (listener != null) listener.onNodeDown(node.id());
+                return;
+            }
 
             // L1/L2 failures move to SUSPECT after threshold.
             if (!l1 || !l2) {
@@ -225,6 +273,91 @@ public class HealthChecker {
         }
     }
 
+    /** Result of one probe round for a node. */
+    private static final class Probe {
+        boolean l1 = true, l2 = false, l3 = false, l4 = true;
+    }
+
+    /**
+     * REVIEW-H1: run the L1..L4 ladder off the scheduler thread with a hard
+     * wall-clock budget.
+     *
+     * <p>Two independent defences, because either alone is insufficient:</p>
+     * <ul>
+     *   <li>Each Cypher probe carries a server-side transaction timeout
+     *       ({@code Neo4jHealthChecker.checkCypher/checkWrite}), so a slow query
+     *       is killed by Neo4j itself.</li>
+     *   <li>The whole ladder runs on {@code probeExecutor} with
+     *       {@code Future.get(budget)}, so a probe that blocks <i>below</i> the
+     *       query layer — a half-open TCP connection inside
+     *       {@code verifyConnectivity()}, a socket that accepts and never
+     *       answers — cannot pin the single {@code health-checker} thread.</li>
+     * </ul>
+     *
+     * <p>A timeout is reported as "L2 failed", which is the truthful reading:
+     * the node did not answer in time. That feeds the normal SUSPECT → DOWN
+     * escalation instead of freezing the state machine.</p>
+     */
+    private Probe runProbeWithBudget(NodeInfo node, Driver driver) {
+        // Budget: TCP + Bolt + Cypher + (optional) write, each bounded by
+        // timeoutMs, plus a little slack. Bounded so the whole sweep of N nodes
+        // still fits comfortably inside a few intervals in the worst case.
+        long budgetMs = Math.max(1_000L, timeoutMs * 4L);
+
+        Future<Probe> future;
+        try {
+            future = probeExecutor.submit(() -> probeInline(node, driver));
+        } catch (RejectedExecutionException ree) {
+            // Executor already shut down (agent stopping, or a probe racing
+            // stop()). Run inline rather than letting an unchecked exception
+            // escape into the health loop.
+            log.debug("Probe executor unavailable for {}; running probe inline", node.id());
+            return probeInline(node, driver);
+        }
+
+        try {
+            return future.get(budgetMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException te) {
+            future.cancel(true);
+            metrics.healthCheckTimeouts.increment();
+            log.warn("Health probe for node {} exceeded its {}ms budget; treating as Bolt "
+                + "failure so the state machine keeps advancing (REVIEW-H1)", node.id(), budgetMs);
+            return unreachableProbe();
+        } catch (Exception e) {
+            log.debug("Health probe for node {} failed: {}", node.id(), e.toString());
+            return unreachableProbe();
+        }
+    }
+
+    /** The L1..L4 ladder, executed on whatever thread calls it. */
+    private Probe probeInline(NodeInfo node, Driver driver) {
+        Probe r = new Probe();
+        try {
+            URI uri = URI.create(node.boltUri().replace("bolt://", "http://"));
+            r.l1 = healthChecker.checkTcp(uri.getHost(),
+                uri.getPort() > 0 ? uri.getPort() : 7687, timeoutMs);
+            if (r.l1) {
+                r.l2 = healthChecker.checkBolt(driver);
+                if (r.l2) {
+                    r.l3 = healthChecker.checkCypher(driver, database);
+                    if (r.l3 && node.role() == NodeRole.PRIMARY) {
+                        r.l4 = healthChecker.checkWrite(driver, database);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Health check error for node {}: {}", node.id(), e.getMessage());
+        }
+        return r;
+    }
+
+    /** "Did not answer in time" — modelled as an L2 failure. */
+    private static Probe unreachableProbe() {
+        Probe p = new Probe();
+        p.l1 = true; p.l2 = false; p.l3 = false; p.l4 = true;
+        return p;
+    }
+
     public HealthState getState(String nodeId) {
         return nodeStates.getOrDefault(nodeId, HealthState.HEALTHY);
     }
@@ -248,6 +381,7 @@ public class HealthChecker {
         l3FailCounts.put(nodeId, 0);
         l4FailCounts.put(nodeId, 0);
         successCounts.put(nodeId, 0);
+        consecutiveFailures.put(nodeId, 0);
         log.info("HealthChecker: suppressed probes for node {}", nodeId);
     }
 

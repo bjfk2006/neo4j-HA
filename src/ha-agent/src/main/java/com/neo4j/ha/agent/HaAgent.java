@@ -100,7 +100,9 @@ public class HaAgent {
         }
 
         IndexInstaller indexInstaller = new IndexInstaller(metrics);
-        indexInstaller.ensureIndexes(primaryDriver, database);
+        // REVIEW-B1: boot is the right place for the duplicate-_elementId audit
+        // (writes are not blocked here); the switchover path passes false.
+        indexInstaller.ensureIndexes(primaryDriver, database, true);
 
         // 6. Start data sync
         CheckpointManager checkpointManager = new CheckpointManager(jedisPool);
@@ -129,8 +131,10 @@ public class HaAgent {
         syncApplier.start(standbyDrivers, database, currentToken);
 
         // 7. Health checker
+        // REVIEW-H3: pass the configured user database; HealthChecker used to
+        // hardcode "neo4j" for its L3/L4 probes.
         HealthChecker healthChecker = new HealthChecker(clusterState, new Neo4jHealthChecker(),
-            metrics, config.failover());
+            metrics, config.failover(), database);
 
         // 8. HAProxy management
         HaProxySocketClient socketClient = new HaProxySocketClient();
@@ -156,7 +160,10 @@ public class HaAgent {
             healthChecker, stateSyncer, haProxyUpdater, clusterState);
 
         // 10. Failover orchestrator
-        FailoverAuditLog auditLog = new FailoverAuditLog(jedisPool);
+        // REVIEW-C7: pass the fencing-token key so persisted failover events
+        // record the epoch instead of a hardcoded 0.
+        FailoverAuditLog auditLog = new FailoverAuditLog(jedisPool,
+            config.failover().fencingToken().key());
         StandbySelector standbySelector = new StandbySelector(clusterState, healthChecker, checkpointManager);
         FailoverOrchestrator failoverOrchestrator = new FailoverOrchestrator(
             healthChecker, fencingTokenManager, cdcCollector, syncApplier,
@@ -173,7 +180,7 @@ public class HaAgent {
         // Recovery handler
         OldPrimaryRecovery recovery = new OldPrimaryRecovery(
             clusterState, syncApplier, cdcCollector, checkpointManager, nodeRegistry,
-            indexInstaller, auditLog, metrics, config.stream().changes()
+            indexInstaller, auditLog, metrics, config.stream().changes(), database
         );
 
         // M2 fix: serialize failover and recovery tasks on a single-thread executor to avoid
@@ -266,6 +273,25 @@ public class HaAgent {
             }
         }, checkIntervalMs, checkIntervalMs, TimeUnit.MILLISECONDS);
 
+        // 12b (REVIEW-B1): duplicate-`_elementId` audit moved OFF the switchover
+        // path and onto this scheduler. It used to piggyback on every
+        // ensureIndexes() call, including the one inside Phase 5 where the whole
+        // cluster is write-blocked; the scan is a per-label full aggregation, so
+        // switchover RTO scaled with database size. Running it here keeps the
+        // BUG-083 gauge fresh without ever holding up a failover.
+        long dupScanIntervalMs = 30L * 60_000L;
+        maintenanceScheduler.scheduleAtFixedRate(() -> {
+            try {
+                String pid = clusterState.getPrimaryNodeId();
+                Driver pd = pid == null ? null : clusterState.getDriver(pid);
+                if (pd != null) {
+                    indexInstaller.ensureIndexes(pd, database, true);
+                }
+            } catch (Exception e) {
+                log.warn("Periodic duplicate-_elementId audit failed", e);
+            }
+        }, dupScanIntervalMs, dupScanIntervalMs, TimeUnit.MILLISECONDS);
+
         // 12c. Stream retention maintenance (BUG-038 + BUG-040). Runs XTRIM MINID
         // periodically on BOTH the incremental changes stream AND the fullsync batch
         // stream, with a cutoff that never exceeds any consumer group's oldest unacked
@@ -320,7 +346,12 @@ public class HaAgent {
                 config.admin().auth() != null ? config.admin().auth().token() : null);
         com.neo4j.ha.agent.http.AuthController authCtrl =
             new com.neo4j.ha.agent.http.AuthController(
-                userStore, sessionManager, rateLimiter, uiAuditLog, metrics, sessionTtlMs);
+                userStore, sessionManager, rateLimiter, uiAuditLog, metrics, sessionTtlMs)
+                // REVIEW-C6: the Secure flag existed but nothing ever set it.
+                .setSecureCookie(uiConfig != null && uiConfig.isSecureCookie())
+                // REVIEW-C4: X-Forwarded-For is only honoured from these peers.
+                .setTrustedProxies(uiConfig != null
+                    ? uiConfig.trustedProxiesOrEmpty() : java.util.List.of());
         com.neo4j.ha.agent.http.AuditController auditCtrl =
             new com.neo4j.ha.agent.http.AuditController(jedisPool, auditLog);
         com.neo4j.ha.agent.http.MetricsSummaryController metricsCtrl =
@@ -341,7 +372,8 @@ public class HaAgent {
 
         // Graceful shutdown hook
         Runtime.getRuntime().addShutdownHook(new Thread(
-            new GracefulShutdown(cdcCollector, syncApplier, recovery, neo4jFactory, redisFactory)));
+            new GracefulShutdown(cdcCollector, syncApplier, recovery, neo4jFactory, redisFactory,
+                failoverOrchestrator)));
 
         log.info("Neo4j HA Agent started successfully. Primary: {}", primaryNodeId);
 
@@ -409,7 +441,13 @@ public class HaAgent {
             }
             NodeServiceState current = node.serviceState();
             String nodeId = node.id();
-            String serverId = node.boltUri().replace("bolt://", "").split(":")[0];
+            // REVIEW-F4: shared parser — the inlined replace/split silently
+            // produced "neo4j"/"bolt+s" for non-bolt:// schemes.
+            String serverId = ClusterStateManager.serverIdFromBoltUri(node.boltUri());
+            if (serverId == null) {
+                log.warn("Cannot derive HAProxy server name from boltUri {} of node {}; "
+                    + "read-backend routing will not be managed for it", node.boltUri(), nodeId);
+            }
 
             long nodeLagMs = checkpointManager.loadSyncCheckpoint(nodeId)
                 .map(cp -> Math.max(0L, primaryLastTs - cp.lastEventTs()))
@@ -420,10 +458,17 @@ public class HaAgent {
                 maxLagMs = Math.max(maxLagMs, nodeLagMs);
                 // BUG-076: publish the per-node lag into NodeInfo so
                 // GET /cluster/status reflects reality instead of a stale 0.
-                // Skip when the checkpoint is missing (nodeLagMs == MAX_VALUE
-                // = unknown); keep the last known value rather than clobbering
-                // with a bogus sentinel.
                 clusterState.updateSyncLag(nodeId, nodeLagMs);
+            } else {
+                // REVIEW-F4: a standby with NO sync checkpoint is the worst case,
+                // not a non-event. The old code excluded it from `anyStandby` and
+                // from `maxLagMs`, so the authoritative neo4j_ha_sync_lag_ms gauge
+                // read 0 precisely when a standby had never synced at all. Mark the
+                // sample as unhealthy so the gauge cannot claim "no lag".
+                anyStandby = true;
+                maxLagMs = Math.max(maxLagMs, syncLagThresholdMs * 3 + 1);
+                log.warn("Standby {} has no sync checkpoint; treating as maximally lagged "
+                    + "for the sync-lag gauge and leaving it out of the ONLINE rotation", nodeId);
             }
 
             if (current == NodeServiceState.SYNCING) {
@@ -437,7 +482,7 @@ public class HaAgent {
                     long stableSince = stableSinceByNode.computeIfAbsent(nodeId, k -> now);
                     if (now - stableSince >= stableDurationMs) {
                         clusterState.setServiceState(nodeId, NodeServiceState.ONLINE);
-                        haProxyUpdater.enableReadBackend(serverId);
+                        if (serverId != null) haProxyUpdater.enableReadBackend(serverId);
                         log.info("Node {} transitioned SYNCING → ONLINE (lag {}ms < {}ms for {}ms)",
                             nodeId, nodeLagMs, syncLagThresholdMs, stableDurationMs);
                         stableSinceByNode.remove(nodeId);
@@ -451,7 +496,7 @@ public class HaAgent {
                 if (!cdcActive) continue;
                 if (nodeLagMs > syncLagThresholdMs * 3) {
                     clusterState.setServiceState(nodeId, NodeServiceState.SYNCING);
-                    haProxyUpdater.disableReadBackend(serverId);
+                    if (serverId != null) haProxyUpdater.disableReadBackend(serverId);
                     log.warn("Node {} transitioned ONLINE → SYNCING (lag {}ms > {}ms)",
                         nodeId, nodeLagMs, syncLagThresholdMs * 3);
                     stableSinceByNode.remove(nodeId);

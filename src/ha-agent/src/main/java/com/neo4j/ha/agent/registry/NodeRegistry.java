@@ -12,6 +12,7 @@ import redis.clients.jedis.JedisPool;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -25,7 +26,16 @@ public class NodeRegistry {
     private final String registryKey;
     private final long updateIntervalMs;
     private final ClusterStateManager clusterState;
-    private final Map<String, NodeInfo> localState = new HashMap<>();
+    /**
+     * REVIEW-S3: was a plain {@link HashMap} written from the {@code ha-failover}
+     * thread ({@code updateRole} / {@code markPendingCleanup}), Javalin HTTP
+     * threads, and the {@code node-registry} scheduler ({@code updateAll} rewrites
+     * every entry every {@code registry.updateInterval}, 2 s by default), while
+     * being read from the {@code health-checker} thread via
+     * {@code isPendingCleanup}. Unsynchronised HashMap mutation under concurrent
+     * resize can lose entries or expose a half-built table to the reader.
+     */
+    private final Map<String, NodeInfo> localState = new ConcurrentHashMap<>();
     private ScheduledExecutorService scheduler;
 
     public NodeRegistry(JedisPool jedisPool, String registryKey, long updateIntervalMs,

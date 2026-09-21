@@ -84,6 +84,25 @@ public class HaMetrics {
     // SYNCING; check agent logs and consider operator-forced fullsync.
     public final Counter autoFullsyncFailedTotal;
 
+    // === Switchover rollback (REVIEW-F1) ===
+    // A switch (failover or switchover) that blocked writes and then threw
+    // before Phase 10 used to leave HAProxy in "all maint" with nothing to
+    // ever undo it. These three count what the rollback path actually did:
+    //   * rolledBack     — writes restored to a node whose CDC is live again
+    //   * strandedBlocked — could NOT restore safely; writes deliberately left
+    //     blocked because unblocking would produce uncaptured writes. THIS IS
+    //     THE ONE TO ALERT ON: cluster is read-only until an operator acts.
+    //   * rejectedConcurrent — a second failover/switchover was refused while
+    //     one was already running (REVIEW-F2).
+    public final Counter switchoverRolledBackTotal;
+    public final Counter switchoverStrandedBlockedTotal;
+    public final Counter switchoverRejectedConcurrentTotal;
+
+    // Health-check probe timeouts (REVIEW-H1). A probe that exceeds its budget
+    // is counted here instead of silently wedging the single health-check
+    // thread (which used to make the agent blind to every other node).
+    public final Counter healthCheckTimeouts;
+
     // === Admin UI metrics ===
     public final Counter uiLoginSuccess;
     public final Counter uiLoginFailure;
@@ -123,9 +142,23 @@ public class HaMetrics {
         failoverDuration = Timer.builder("neo4j_ha_failover_duration")
             .description("Failover duration").register(registry);
 
+        // Switchover rollback (REVIEW-F1 / F2)
+        switchoverRolledBackTotal = Counter.builder("neo4j_ha_switchover_rolled_back_total")
+            .description("Aborted switches whose write-block was safely rolled back")
+            .register(registry);
+        switchoverStrandedBlockedTotal = Counter.builder("neo4j_ha_switchover_stranded_blocked_total")
+            .description("Aborted switches that left the cluster write-blocked on purpose (ALERT)")
+            .register(registry);
+        switchoverRejectedConcurrentTotal = Counter.builder("neo4j_ha_switchover_rejected_concurrent_total")
+            .description("Failover/switchover requests refused because one was already running")
+            .register(registry);
+
         // Health
         healthCheckFailures = Counter.builder("neo4j_ha_health_check_failures_total")
             .description("Health check failures").register(registry);
+        healthCheckTimeouts = Counter.builder("neo4j_ha_health_check_timeouts_total")
+            .description("Health check probes that exceeded their timeout budget")
+            .register(registry);
 
         // HAProxy
         haproxyUpdateErrors = Counter.builder("neo4j_ha_haproxy_update_errors_total")

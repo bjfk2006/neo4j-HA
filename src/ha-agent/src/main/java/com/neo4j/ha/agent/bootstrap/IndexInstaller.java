@@ -24,7 +24,36 @@ public class IndexInstaller {
         this.metrics = metrics;
     }
 
+    /**
+     * Ensure indexes/constraints, including the duplicate-`_elementId` audit scan.
+     *
+     * <p>REVIEW-B1: latency-sensitive callers (the switchover/failover path,
+     * which holds a cluster-wide write block) must use
+     * {@link #ensureIndexes(Driver, String, boolean)} with {@code false}.</p>
+     */
     public void ensureIndexes(Driver driver, String database) {
+        ensureIndexes(driver, database, true);
+    }
+
+    /**
+     * @param runDupElementIdScan run the BUG-083 duplicate-`_elementId` audit.
+     *
+     * <p><b>REVIEW-B1</b>: this scan used to run unconditionally inside
+     * {@code ensureIndexes}, which is called from {@code FailoverOrchestrator}
+     * Phase 5 — i.e. <i>while every client write in the cluster is blocked</i>.
+     * The scan is a per-label
+     * {@code MATCH (n:L) ... WITH n._elementId, count(*) ...} aggregation: it
+     * reads every node of every user label and builds a grouping table whose
+     * cardinality is the node count. The comment claiming it was "index-only and
+     * therefore cheap" was wrong — an index scan still walks every entry, and
+     * the aggregation still materialises. So switchover RTO grew linearly with
+     * database size, and if the scan OOM'd or timed out it threw out of Phase 5
+     * and (before REVIEW-F1) left the cluster permanently write-blocked.</p>
+     *
+     * <p>Boot and the periodic maintenance tick pass true; the switch path
+     * passes false.</p>
+     */
+    public void ensureIndexes(Driver driver, String database, boolean runDupElementIdScan) {
         try (Session session = driver.session(SessionConfig.forDatabase(database))) {
             // Get all labels
             List<String> labels = session.run("CALL db.labels() YIELD label RETURN label")
@@ -103,14 +132,19 @@ public class IndexInstaller {
             // on large graphs. On a dirty database where constraint creation
             // failed, the orphan _elementId RANGE INDEX is still present and
             // serves the same plan.
-            long dupNodes = scanDupElementIdNodes(session, labels);
-            if (metrics != null) {
-                metrics.dupElementIdNodes.set(dupNodes);
-            }
-            if (dupNodes > 0) {
-                log.warn("BUG-083: found {} nodes with duplicate `_elementId` PROPERTY on '{}'. " +
-                    "Run scripts/deploy/elementid-dedup.sh on the primary to clear, then restart " +
-                    "the ha-agent so the UNIQUE constraint installs cleanly.", dupNodes, database);
+            if (runDupElementIdScan) {
+                long dupNodes = scanDupElementIdNodes(session, labels);
+                if (metrics != null) {
+                    metrics.dupElementIdNodes.set(dupNodes);
+                }
+                if (dupNodes > 0) {
+                    log.warn("BUG-083: found {} nodes with duplicate `_elementId` PROPERTY on '{}'. " +
+                        "Run scripts/deploy/elementid-dedup.sh on the primary to clear, then restart " +
+                        "the ha-agent so the UNIQUE constraint installs cleanly.", dupNodes, database);
+                }
+            } else {
+                log.debug("Skipping duplicate-_elementId audit scan (REVIEW-B1: not on the "
+                    + "switchover path, where writes are globally blocked)");
             }
 
             // _CDCDeleteEvent timestamp index

@@ -48,13 +48,23 @@ public class RateLimiter {
 
     public void recordFailure(String ip) {
         if (ip == null) return;
+        long now = System.currentTimeMillis();
+        // REVIEW-C4 follow-up: expire stale entries before consulting the caps,
+        // and never let a full table turn into "failures are no longer counted".
+        // `lockedUntil` in particular was only ever pruned when the SAME ip came
+        // back, so entries from IPs that never return stayed forever.
+        if (windows.size() > MAX_TRACKED_IPS || lockedUntil.size() > MAX_TRACKED_IPS) {
+            purgeExpired(now);
+        }
         if (windows.size() > MAX_TRACKED_IPS) {
-            // Defensive: don't unbounded-grow under flood. New IPs are silently
-            // not tracked; existing IPs still feed their counters. Better than OOM.
-            log.warn("RateLimiter map at cap ({}); dropping further new IPs", MAX_TRACKED_IPS);
+            // Still full after purging: prefer locking this IP outright over
+            // silently not counting its failures (the old behaviour, which let a
+            // flood of distinct source IPs switch the limiter off entirely).
+            log.warn("RateLimiter map at cap ({}) after purge; locking {} directly",
+                MAX_TRACKED_IPS, ip);
+            lockedUntil.put(ip, now + lockMs);
             return;
         }
-        long now = System.currentTimeMillis();
         Window w = windows.computeIfAbsent(ip, k -> new Window(now));
         int count = w.recordIfWithinWindow(now);
         if (count >= maxFailures) {
@@ -73,6 +83,18 @@ public class RateLimiter {
     /** Visible for tests. */
     int trackedIpCount() { return windows.size() + lockedUntil.size(); }
 
+    /**
+     * Drop expired lockouts and stale windows. REVIEW-C4 follow-up: without this
+     * both maps only ever shrank when the same IP was seen again, so any burst
+     * of one-shot source addresses grew them without bound.
+     */
+    void purgeExpired(long now) {
+        lockedUntil.entrySet().removeIf(e -> e.getValue() <= now);
+        windows.entrySet().removeIf(e -> e.getValue().isStale(now));
+        log.info("RateLimiter purge: {} windows / {} locks remain",
+            windows.size(), lockedUntil.size());
+    }
+
     private static final class Window {
         private long windowStart;
         private final AtomicInteger count = new AtomicInteger(0);
@@ -85,6 +107,10 @@ public class RateLimiter {
                 count.set(0);
             }
             return count.incrementAndGet();
+        }
+
+        synchronized boolean isStale(long now) {
+            return now - windowStart > WINDOW_MS;
         }
     }
 }
