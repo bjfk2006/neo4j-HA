@@ -71,6 +71,10 @@ public class StreamMaintenanceTask implements Runnable {
      */
     private volatile boolean minIdUnsupported = false;
 
+    /** Groups already announced as abandoned, so the notice is not repeated every cycle. */
+    private final java.util.Set<String> reportedAbandonedGroups =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     /** Max entries examined per pass in the Lua fallback. */
     private static final int LUA_TRIM_BUDGET = 10_000;
 
@@ -243,10 +247,15 @@ public class StreamMaintenanceTask implements Runnable {
                 // the cutoff computation (they are never deleted here; that stays
                 // an operator decision).
                 if (isAbandonedGroup(group)) {
-                    log.warn("Stream maintenance: ignoring abandoned consumer group '{}' on {} "
-                        + "for retention (no consumers / all idle > {}ms, PEL empty). "
-                        + "Delete it with XGROUP DESTROY once the node is decommissioned.",
-                        group.getName(), streamKey, ABANDONED_GROUP_IDLE_MS);
+                    // Announce each group once; this runs every maintenanceInterval
+                    // (60 s by default) and an abandoned group stays abandoned.
+                    if (reportedAbandonedGroups.add(streamKey + "/" + group.getName())) {
+                        log.warn("Stream maintenance: ignoring abandoned consumer group '{}' on {} "
+                            + "for retention (no consumers / all idle > {}ms, PEL empty). "
+                            + "Delete it with XGROUP DESTROY once the node is decommissioned. "
+                            + "Logged once per group.",
+                            group.getName(), streamKey, ABANDONED_GROUP_IDLE_MS);
+                    }
                     continue;
                 }
                 StreamEntryID groupOldest = oldestNeededForGroup(group);
