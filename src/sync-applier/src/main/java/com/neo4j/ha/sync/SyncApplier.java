@@ -412,6 +412,14 @@ public class SyncApplier {
 
     /** Package-private accessor used by {@link SyncApplierTest} to assert schedule state. */
     boolean isPendingRecoveryScheduled(String nodeId) {
+        // REVIEW-T1: `pendingRecoveryRequests` is a ConcurrentHashMap KeySetView,
+        // which throws NPE on contains(null) rather than returning false.
+        // `schedulePendingRecovery` already treats a null nodeId as a no-op, so
+        // this inspector must be able to answer "no" for the same input instead
+        // of blowing up — the asymmetry is what made
+        // SyncApplierTest.bug074_schedulePendingRecovery_nullNode_isNoop fail
+        // with an NPE raised by the assertion, not by the method under test.
+        if (nodeId == null) return false;
         return pendingRecoveryRequests.contains(nodeId);
     }
 

@@ -11,6 +11,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Unit tests for {@link ChangeApplier#splitByDuplicateElementId(List)}.
@@ -158,11 +159,32 @@ class ChangeApplierSplitTest {
 
         List<List<ChangeEvent>> out = ChangeApplier.splitByDuplicateElementId(events);
 
-        assertEquals(2, out.size());
-        assertEquals(51, out.get(0).size()); // 50 uniques + first collision
-        assertEquals(50, out.get(1).size()); // second collision + 48 uniques + tail
+        // REVIEW-T4: the split happens when the duplicate is ENCOUNTERED, i.e.
+        // at the SECOND occurrence (index 99) — not after the first one. The
+        // old expectation (51/50) implied cutting right after the first
+        // occurrence, which would require lookahead and buys nothing: both
+        // shapes satisfy the only invariant that matters (no two events sharing
+        // an _elementId inside one transaction), and the single-pass rule is
+        // already minimal at exactly one extra commit.
+        assertEquals(2, out.size(), "exactly one extra commit, no further fragmentation");
+        assertEquals(99, out.get(0).size()); // everything up to (not incl.) the duplicate
+        assertEquals(2, out.get(1).size());  // the duplicate + tail
         assertEquals(events.size(), out.get(0).size() + out.get(1).size(),
             "no events lost across the split boundary");
+        assertNoDuplicateElementIdWithinSubBatch(out);
+    }
+
+    /** The actual contract of the split: never two same-_elementId events in one tx. */
+    private static void assertNoDuplicateElementIdWithinSubBatch(List<List<ChangeEvent>> out) {
+        for (List<ChangeEvent> sub : out) {
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            for (ChangeEvent ev : sub) {
+                String eid = ev.entity() != null ? ev.entity().elementId() : null;
+                if (eid == null) continue;
+                assertTrue(seen.add(eid),
+                    "duplicate _elementId " + eid + " inside a single sub-batch");
+            }
+        }
     }
 
     // ---- helpers -------------------------------------------------------

@@ -25,6 +25,18 @@ class FullSyncReceiverTest {
         fullSyncConsumer = mock(FullSyncConsumer.class);
         driver = mock(Driver.class);
         receiver = new FullSyncReceiver(databaseCleaner, fullSyncConsumer, "neo4j");
+
+        // REVIEW-T3: BUG-085 changed two things these tests never caught up with.
+        //   1. consumeFullSyncBatches gained a `snapshotTs` parameter, so the
+        //      3-arg verify() below could never match.
+        //   2. onFullSyncStart became synchronous and lets the RETURN VALUE drive
+        //      the state machine: true -> CATCHING_UP, false -> back to IDLE.
+        // An unstubbed Mockito boolean returns false, so every test that called
+        // onFullSyncStart landed in IDLE and then asserted RECEIVING/CATCHING_UP.
+        // Stub the happy path here; the failure path gets its own test below.
+        lenient().when(fullSyncConsumer.consumeFullSyncBatches(
+                any(Driver.class), anyString(), anyString(), anyLong()))
+            .thenReturn(true);
     }
 
     @Test
@@ -39,12 +51,27 @@ class FullSyncReceiverTest {
     }
 
     @Test
-    void onFullSyncStart_transitionsToReceiving() {
+    void onFullSyncStart_completesIntoCatchingUp() {
         ChangeEvent event = makeFullSyncStartEvent(null);
 
         receiver.onFullSyncStart(event, driver, "node-1");
 
-        assertEquals(FullSyncReceiver.State.RECEIVING, receiver.getState());
+        // BUG-085: the call is synchronous — by the time it returns, the batches
+        // have been consumed and the receiver is already catching up on the
+        // incremental stream. RECEIVING is only observable from another thread.
+        assertEquals(FullSyncReceiver.State.CATCHING_UP, receiver.getState());
+    }
+
+    @Test
+    void onFullSyncStart_returnsToIdleWhenConsumeFails() {
+        when(fullSyncConsumer.consumeFullSyncBatches(
+                any(Driver.class), anyString(), anyString(), anyLong()))
+            .thenReturn(false);
+
+        receiver.onFullSyncStart(makeFullSyncStartEvent(null), driver, "node-1");
+
+        assertEquals(FullSyncReceiver.State.IDLE, receiver.getState(),
+            "a failed fullsync must not leave the receiver claiming to be in sync");
     }
 
     @Test
@@ -62,7 +89,7 @@ class FullSyncReceiverTest {
 
         receiver.onFullSyncStart(event, driver, "node-1");
 
-        verify(fullSyncConsumer).consumeFullSyncBatches(driver, "neo4j", "node-1");
+        verify(fullSyncConsumer).consumeFullSyncBatches(eq(driver), eq("neo4j"), eq("node-1"), anyLong());
     }
 
     @Test
@@ -75,12 +102,13 @@ class FullSyncReceiverTest {
     }
 
     @Test
-    void isReceiving_duringReceiving_returnsTrue() {
+    void isReceiving_afterSuccessfulStart_returnsFalse() {
         ChangeEvent event = makeFullSyncStartEvent(null);
         receiver.onFullSyncStart(event, driver, "node-1");
 
-        assertTrue(receiver.isReceiving(),
-                "Should be receiving after onFullSyncStart");
+        assertFalse(receiver.isReceiving(),
+                "onFullSyncStart is synchronous (BUG-085): once it returns, bulk "
+                + "receiving is done and the receiver is in CATCHING_UP");
     }
 
     @Test
@@ -93,6 +121,8 @@ class FullSyncReceiverTest {
         ChangeEvent endEvent = makeEvent(ChangeEventType.FULL_SYNC_END);
         receiver.onFullSyncEnd(endEvent);
 
+        // Already CATCHING_UP after the synchronous start; FULL_SYNC_END is
+        // idempotent in that state.
         assertEquals(FullSyncReceiver.State.CATCHING_UP, receiver.getState());
     }
 

@@ -100,20 +100,41 @@ class HealthCheckerTest {
         lenient().when(neo4jHealthChecker.checkTcp(anyString(), anyInt(), anyInt())).thenReturn(true);
         lenient().when(neo4jHealthChecker.checkBolt(any(Driver.class))).thenReturn(true);
         lenient().when(neo4jHealthChecker.checkCypher(any(Driver.class), anyString())).thenReturn(true);
+        // REVIEW-T5: testNode() is PRIMARY, so the L4 write probe runs too. An
+        // unstubbed Mockito boolean is false, which silently kept "healthy"
+        // rounds from ever being all-green.
+        lenient().when(neo4jHealthChecker.checkWrite(any(Driver.class), anyString())).thenReturn(true);
     }
 
     // ---------------------------------------------------------------
     // HEALTHY -> SUSPECT after 1 fail
     // ---------------------------------------------------------------
 
+    /**
+     * REVIEW-T5: these transition tests encoded the PRE-BUG-068 thresholds
+     * ("1st failure -> SUSPECT, failThreshold-th -> DOWN"). BUG-068/BUG-075
+     * deliberately moved both edges out:
+     *   SUSPECT at failThreshold consecutive L1/L2 failures,
+     *   DOWN    at 2 x failThreshold.
+     * The reason is stated in HealthChecker: a single blip must not move a node
+     * off HEALTHY, and DOWN is the only trigger for failover, so it needs to
+     * survive transient network noise while still beating client retry budgets
+     * (~12 s at the default 2 s interval). With failThreshold=3 in this fixture
+     * that means 3 failures -> SUSPECT and 6 -> DOWN.
+     */
     @Test
-    void transitionsFromHealthyToSuspectAfterOneFail() throws Exception {
+    void staysHealthyUntilFailThresholdThenSuspect() throws Exception {
         stubUnhealthy();
 
         assertEquals(HealthState.HEALTHY, healthChecker.getState(NODE_ID));
 
         invokeCheckNode();
+        assertEquals(HealthState.HEALTHY, healthChecker.getState(NODE_ID),
+            "one blip must not move the node off HEALTHY");
+        invokeCheckNode();
+        assertEquals(HealthState.HEALTHY, healthChecker.getState(NODE_ID));
 
+        invokeCheckNode();   // 3rd == failThreshold
         assertEquals(HealthState.SUSPECT, healthChecker.getState(NODE_ID));
         verify(clusterState).updateHealth(NODE_ID, NodeHealth.SUSPECT);
     }
@@ -126,16 +147,15 @@ class HealthCheckerTest {
     void transitionsFromSuspectToDownAfterThresholdFails() throws Exception {
         stubUnhealthy();
 
-        // Fail 3 times (failThreshold = 3): 1st -> SUSPECT, 2nd -> still SUSPECT, 3rd -> DOWN
-        invokeCheckNode();
+        // failThreshold = 3 -> SUSPECT at 3, DOWN at 2 x 3 = 6 (BUG-068/075).
+        for (int i = 0; i < 3; i++) invokeCheckNode();
         assertEquals(HealthState.SUSPECT, healthChecker.getState(NODE_ID));
 
-        invokeCheckNode();
-        // Still SUSPECT (fail count = 2, threshold = 3)
-        assertEquals(HealthState.SUSPECT, healthChecker.getState(NODE_ID));
+        for (int i = 0; i < 2; i++) invokeCheckNode();
+        assertEquals(HealthState.SUSPECT, healthChecker.getState(NODE_ID),
+            "5 failures is still below 2 x failThreshold");
 
-        invokeCheckNode();
-        // Now DOWN (fail count = 3 >= threshold)
+        invokeCheckNode();   // 6th
         assertEquals(HealthState.DOWN, healthChecker.getState(NODE_ID));
         verify(clusterState).updateHealth(NODE_ID, NodeHealth.DOWN);
     }
@@ -146,9 +166,9 @@ class HealthCheckerTest {
 
     @Test
     void transitionsFromDownToHealthyAfterThresholdSuccesses() throws Exception {
-        // First, drive the node to DOWN state
+        // First, drive the node to DOWN state (2 x failThreshold, BUG-068/075)
         stubUnhealthy();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 6; i++) {
             invokeCheckNode();
         }
         assertEquals(HealthState.DOWN, healthChecker.getState(NODE_ID));
@@ -206,7 +226,7 @@ class HealthCheckerTest {
         // After unsuppress, normal probe should resume and eventually mark DOWN.
         healthChecker.unsuppress(NODE_ID);
         assertFalse(healthChecker.isSuppressed(NODE_ID));
-        for (int i = 0; i < 3; i++) invokeCheckNode();   // failThreshold = 3
+        for (int i = 0; i < 6; i++) invokeCheckNode();   // 2 x failThreshold
         assertEquals(HealthState.DOWN, healthChecker.getState(NODE_ID));
     }
 }
