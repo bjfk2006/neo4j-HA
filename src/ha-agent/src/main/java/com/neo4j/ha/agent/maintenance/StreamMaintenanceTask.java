@@ -66,10 +66,65 @@ public class StreamMaintenanceTask implements Runnable {
     private ScheduledExecutorService scheduler;
 
     /**
-     * REVIEW-C11: set once when the server rejects XTRIM MINID (Redis &lt; 6.2),
-     * so the failure is reported a single time instead of every interval.
+     * REVIEW-C11: set once when the server rejects {@code XTRIM MINID}
+     * (added in Redis 6.2), after which {@link #TRIM_BELOW_LUA} is used instead.
      */
     private volatile boolean minIdUnsupported = false;
+
+    /** Max entries examined per pass in the Lua fallback. */
+    private static final int LUA_TRIM_BUDGET = 10_000;
+
+    /**
+     * MINID-equivalent trim for Redis &lt; 6.2, verified against Redis 6.0.16.
+     *
+     * <p>Two things are unavailable before 6.2 and the workaround relies on
+     * neither: {@code XTRIM MINID} itself, and XRANGE's exclusive {@code (id}
+     * bound. What IS available since 5.0 is the shorthand where a bare
+     * {@code <ms>} as an XRANGE end bound means {@code <ms>-<maxseq>} — so
+     * asking for {@code XRANGE key - (cutoffMs-1)} returns exactly the entries
+     * strictly older than {@code cutoffMs-0}, which is precisely MINID's
+     * deletion set for the cutoffs this class produces (always seq 0).</p>
+     *
+     * <p>Why Lua rather than doing this from Java: computing the obsolete count
+     * and then trimming would be two round trips, and any XADD landing between
+     * them makes a length-based {@code XTRIM MAXLEN} cut too deep — it would
+     * drop entries just above the cutoff that a lagging standby still needs,
+     * which is the exact failure mode this whole task exists to prevent. A
+     * script executes atomically, so the count and the trim cannot be separated.</p>
+     *
+     * <p>The common path uses {@code XTRIM MAXLEN} once the full obsolete set is
+     * known, because that genuinely reclaims macro nodes; {@code XDEL} only
+     * tombstones entries. XDEL is used solely for the catch-up path where the
+     * budget was exhausted and the remainder is handled next cycle.</p>
+     */
+    private static final String TRIM_BELOW_LUA =
+        "local cutoffMs = tonumber(ARGV[1])\n" +
+        "local budget   = tonumber(ARGV[2])\n" +
+        "if cutoffMs == nil or cutoffMs <= 0 then return 0 end\n" +
+        "local upper = tostring(cutoffMs - 1)\n" +
+        "local entries = redis.call('XRANGE', KEYS[1], '-', upper, 'COUNT', budget)\n" +
+        "local n = #entries\n" +
+        "if n == 0 then return 0 end\n" +
+        "if n < budget then\n" +
+        "  local len = redis.call('XLEN', KEYS[1])\n" +
+        "  local keep = len - n\n" +
+        "  if keep < 0 then keep = 0 end\n" +
+        "  redis.call('XTRIM', KEYS[1], 'MAXLEN', keep)\n" +
+        "  return n\n" +
+        "end\n" +
+        "local i = 1\n" +
+        "local deleted = 0\n" +
+        "while i <= n do\n" +
+        "  local chunk = {}\n" +
+        "  local j = 0\n" +
+        "  while i <= n and j < 200 do\n" +
+        "    j = j + 1\n" +
+        "    chunk[j] = entries[i][1]\n" +
+        "    i = i + 1\n" +
+        "  end\n" +
+        "  deleted = deleted + redis.call('XDEL', KEYS[1], unpack(chunk, 1, j))\n" +
+        "end\n" +
+        "return deleted\n";
 
     /** Single-stream convenience constructor. */
     public StreamMaintenanceTask(JedisPool jedisPool, String streamKey,
@@ -214,33 +269,31 @@ public class StreamMaintenanceTask implements Runnable {
             }
             StreamEntryID cutoff = new StreamEntryID(cutoffMs, 0);
 
-            if (minIdUnsupported) return -1L;
-
             long trimmed;
-            try {
-                trimmed = jedis.xtrim(streamKey,
-                        XTrimParams.xTrimParams().minId(cutoff.toString()).approximateTrimming());
-            } catch (redis.clients.jedis.exceptions.JedisDataException e) {
-                // REVIEW-C11 (found while verifying on the HK cluster): XTRIM MINID
-                // was added in Redis 6.2. On an older server the command is rejected
-                // with a bare "ERR syntax error", which this task logged once per
-                // interval forever while silently never trimming anything. The whole
-                // point of BUG-038 — consumer-aware retention, so a lagging standby's
-                // PEL can never be trimmed out from under it — was therefore inactive,
-                // with XADD's MAXLEN (a consumer-AGNOSTIC cap) as the only retention.
-                // Detect it once, say so loudly and actionably, then stop retrying.
-                String msg = e.getMessage() == null ? "" : e.getMessage();
-                if (msg.contains("syntax error")) {
+            if (minIdUnsupported) {
+                trimmed = trimBelowViaLua(jedis, streamKey, cutoffMs);
+            } else {
+                try {
+                    trimmed = jedis.xtrim(streamKey,
+                            XTrimParams.xTrimParams().minId(cutoff.toString()).approximateTrimming());
+                } catch (redis.clients.jedis.exceptions.JedisDataException e) {
+                    // REVIEW-C11 (found while verifying on the HK cluster): XTRIM MINID
+                    // was added in Redis 6.2. On an older server it is rejected with a
+                    // bare "ERR syntax error", which this task logged once per interval
+                    // forever while silently never trimming anything — so BUG-038's
+                    // whole point (consumer-aware retention, so a lagging standby's PEL
+                    // can never be trimmed out from under it) was inactive, leaving
+                    // XADD's consumer-AGNOSTIC MAXLEN as the only bound.
+                    String msg = e.getMessage() == null ? "" : e.getMessage();
+                    if (!msg.contains("syntax error")) throw e;
                     minIdUnsupported = true;
-                    log.error("XTRIM MINID rejected by this Redis ({}). MINID requires Redis 6.2+; "
-                        + "consumer-aware stream retention is DISABLED and the only bound on {} "
-                        + "is XADD's MAXLEN, which can drop entries a lagging standby still has "
-                        + "in its PEL (BUG-038). Upgrade Redis to >= 6.2, or size stream.maxLen "
-                        + "to cover the worst tolerated standby lag. This message is logged once.",
+                    log.warn("XTRIM MINID rejected by this Redis ({}) — MINID needs 6.2+. "
+                        + "Falling back to an equivalent atomic Lua trim for {} (works on 5.0+). "
+                        + "Consumer-aware retention stays active; upgrading Redis to >= 6.2 "
+                        + "would let the native command be used again. Logged once.",
                         msg, streamKey);
-                    return -1L;
+                    trimmed = trimBelowViaLua(jedis, streamKey, cutoffMs);
                 }
-                throw e;
             }
 
             if (metrics != null) {
@@ -265,6 +318,14 @@ public class StreamMaintenanceTask implements Runnable {
      * For a healthy group with empty PEL this is {@code lastDeliveredId}; for a group
      * that has in-flight (delivered but unACK'd) messages it is the minimum PEL id.
      */
+    /** Runs {@link #TRIM_BELOW_LUA}; returns how many entries it removed. */
+    private long trimBelowViaLua(Jedis jedis, String streamKey, long cutoffMs) {
+        Object r = jedis.eval(TRIM_BELOW_LUA,
+                java.util.List.of(streamKey),
+                java.util.List.of(Long.toString(cutoffMs), Integer.toString(LUA_TRIM_BUDGET)));
+        return (r instanceof Number num) ? num.longValue() : 0L;
+    }
+
     /**
      * A group counts as abandoned when it has no live consumer activity for
      * {@link #ABANDONED_GROUP_IDLE_MS} AND holds nothing in any PEL. The PEL
