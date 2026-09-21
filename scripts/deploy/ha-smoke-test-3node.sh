@@ -56,7 +56,12 @@ require_cmd python3
 [[ -n "${ADMIN_TOKEN}" ]] || die "ADMIN_TOKEN is required"
 
 get_cluster_status() {
-  curl -fsS "${AGENT_URL}/cluster/status"
+  # /cluster/* sits behind AuthFilter (see AdminHttpServer AUTH_REQUIRED_PREFIXES).
+  # Without the header this returns 401 on any agent that has admin.auth.token or
+  # the UI configured — which is every real deployment, so the smoke test failed
+  # at its very first check. The POSTs further down already sent this header;
+  # only the reads were missed.
+  curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${AGENT_URL}/cluster/status"
 }
 
 json_get_primary_node() {

@@ -136,12 +136,12 @@ fail() { echo "[backup $(ts)] ERROR: $*" >&2; exit 3; }
 fail_contract() { echo "[backup $(ts)] CONTRACT VIOLATION: $*" >&2; exit 4; }
 
 cluster_status() {
-  curl -sf "${AGENT_URL}/cluster/status" || return 1
+  curl -sf -H "Authorization: Bearer ${ADMIN_TOKEN}" "${AGENT_URL}/cluster/status" || return 1
 }
 
 backup_status() {
   # GET /cluster/backup/status does NOT require the admin token.
-  curl -sf "${AGENT_URL}/cluster/backup/status" || return 1
+  curl -sf -H "Authorization: Bearer ${ADMIN_TOKEN}" "${AGENT_URL}/cluster/backup/status" || return 1
 }
 
 backup_prepare() {

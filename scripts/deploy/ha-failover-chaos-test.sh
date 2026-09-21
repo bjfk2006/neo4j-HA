@@ -136,7 +136,7 @@ nodeid_to_container() {
 
 # Query cluster status, return JSON via stdout.
 cluster_status() {
-  curl -sf "${AGENT_URL}/cluster/status" || return 1
+  curl -sf -H "Authorization: Bearer ${ADMIN_TOKEN}" "${AGENT_URL}/cluster/status" || return 1
 }
 
 # -----------------------------------------------------------------------------

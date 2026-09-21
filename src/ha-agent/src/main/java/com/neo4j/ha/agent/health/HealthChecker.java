@@ -6,6 +6,7 @@ import com.neo4j.ha.common.metrics.HaMetrics;
 import com.neo4j.ha.common.model.NodeHealth;
 import com.neo4j.ha.common.model.NodeInfo;
 import com.neo4j.ha.common.model.NodeRole;
+import com.neo4j.ha.common.model.NodeServiceState;
 import com.neo4j.ha.common.neo4j.Neo4jHealthChecker;
 import org.neo4j.driver.Driver;
 import org.slf4j.Logger;
@@ -112,7 +113,14 @@ public class HealthChecker {
     public void start() {
         // Initialize all nodes as HEALTHY
         for (NodeInfo node : clusterState.getAllNodes()) {
-            nodeStates.put(node.id(), HealthState.HEALTHY);
+            // REVIEW-C12: seed from what ClusterInitializer actually probed, not
+            // a blanket HEALTHY. A node that was unreachable at boot is
+            // serviceState=OFFLINE; if we seed it HEALTHY and it comes back
+            // before accumulating 2 x failThreshold failures, there is never a
+            // DOWN -> HEALTHY edge, `onNodeRecovered` never fires, and the node
+            // stays OFFLINE forever with nothing to move it on.
+            nodeStates.put(node.id(),
+                node.health() == NodeHealth.DOWN ? HealthState.DOWN : HealthState.HEALTHY);
             l12FailCounts.put(node.id(), 0);
             l3FailCounts.put(node.id(), 0);
             l4FailCounts.put(node.id(), 0);
@@ -164,6 +172,13 @@ public class HealthChecker {
             if (currentState == HealthState.DOWN && successes >= successThreshold) {
                 nodeStates.put(node.id(), HealthState.HEALTHY);
                 clusterState.updateHealth(node.id(), NodeHealth.HEALTHY);
+                // REVIEW-C12: leave OFFLINE behind. SYNCING is the correct
+                // re-entry point — HaAgent.evaluateServiceStates promotes to
+                // ONLINE only once the node's replication lag has been under
+                // the threshold for stableDuration.
+                if (clusterState.getServiceState(node.id()) == NodeServiceState.OFFLINE) {
+                    clusterState.setServiceState(node.id(), NodeServiceState.SYNCING);
+                }
                 log.info("Node {} recovered (was DOWN)", node.id());
                 if (listener != null) listener.onNodeRecovered(node.id());
             } else if (currentState != HealthState.HEALTHY && currentState != HealthState.DOWN
@@ -189,6 +204,7 @@ public class HealthChecker {
             if (consecutive >= failThreshold * 2 && currentState != HealthState.DOWN) {
                 nodeStates.put(node.id(), HealthState.DOWN);
                 clusterState.updateHealth(node.id(), NodeHealth.DOWN);
+                markOffline(node.id());
                 log.error("{} {} is DOWN ({} consecutive unhealthy probes across mixed layers; "
                         + "l1={} l2={} l3={} l4={})",
                     node.role() == NodeRole.PRIMARY ? "Primary" : "Standby",
@@ -231,6 +247,7 @@ public class HealthChecker {
                 if (l12Fails >= failThreshold * 2 && currentState != HealthState.DOWN) {
                     nodeStates.put(node.id(), HealthState.DOWN);
                     clusterState.updateHealth(node.id(), NodeHealth.DOWN);
+                    markOffline(node.id());
                     log.error("{} {} is DOWN (L1/L2 failed {} times; TCP/Bolt unreachable)",
                               node.role() == NodeRole.PRIMARY ? "Primary" : "Standby",
                               node.id(), l12Fails);
@@ -262,6 +279,7 @@ public class HealthChecker {
                 if (l4Fails >= 2 && currentState != HealthState.DOWN) {
                     nodeStates.put(node.id(), HealthState.DOWN);
                     clusterState.updateHealth(node.id(), NodeHealth.DOWN);
+                    markOffline(node.id());
                     log.error("Node {} is DOWN (L4 failed {} times)", node.id(), l4Fails);
                     if (listener != null) listener.onNodeDown(node.id());
                 } else {
@@ -270,6 +288,25 @@ public class HealthChecker {
                     log.warn("Node {} is UNHEALTHY (L4 write check failed)", node.id());
                 }
             }
+        }
+    }
+
+    /**
+     * REVIEW-C12: a node that is DOWN cannot be serving traffic, so its
+     * serviceState must follow.
+     *
+     * <p>{@code NodeServiceState}'s own documentation has always specified
+     * {@code ONLINE -> OFFLINE: Node goes down} and
+     * {@code SYNCING -> OFFLINE: Node goes down}, but nothing implemented it:
+     * failover set {@code role=DOWN} and left serviceState untouched, so
+     * {@code GET /cluster/status} advertised dead nodes as
+     * {@code "role":"DOWN","serviceState":"ONLINE"}. Anything treating
+     * serviceState as the readiness signal — the chaos-test precheck, dashboards,
+     * an operator eyeballing the endpoint mid-incident — read that as healthy.</p>
+     */
+    private void markOffline(String nodeId) {
+        if (clusterState.getServiceState(nodeId) != NodeServiceState.OFFLINE) {
+            clusterState.setServiceState(nodeId, NodeServiceState.OFFLINE);
         }
     }
 

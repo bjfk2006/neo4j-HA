@@ -465,6 +465,13 @@ public class FailoverOrchestrator {
             clusterState.setPrimary(newPrimary);
             clusterState.updateRole(newPrimary, NodeRole.PRIMARY);
             clusterState.updateRole(failedNodeId, NodeRole.DOWN);
+            // REVIEW-C12: role and serviceState must agree. Without this the
+            // failed node kept whatever serviceState it had — typically ONLINE —
+            // so /cluster/status reported role=DOWN alongside serviceState=ONLINE.
+            // HealthChecker also sets this when it declares a node DOWN, but the
+            // manual-failover path can run against a node it still considers
+            // healthy, so set it here too.
+            clusterState.setServiceState(failedNodeId, NodeServiceState.OFFLINE);
             log.info("Phase 7: Cluster state updated");
 
             // Phase 8: Restart SyncApplier with remaining standbys

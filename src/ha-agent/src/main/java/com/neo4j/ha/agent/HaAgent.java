@@ -490,6 +490,20 @@ public class HaAgent {
                 } else {
                     stableSinceByNode.remove(nodeId);
                 }
+            } else if (current == NodeServiceState.OFFLINE) {
+                // REVIEW-C12: OFFLINE used to be a dead end here — neither branch
+                // below matched it, so a node that reached OFFLINE could never be
+                // evaluated back into rotation by this loop. Two things to do:
+                // keep it out of the read backend while it is down, and hand it
+                // back to the normal SYNCING -> ONLINE path once it is healthy
+                // again (belt and braces with HealthChecker's recovery edge).
+                if (serverId != null) haProxyUpdater.disableReadBackend(serverId);
+                stableSinceByNode.remove(nodeId);
+                NodeInfo info = clusterState.getNodeInfo(nodeId);
+                if (info != null && info.health() == NodeHealth.HEALTHY) {
+                    clusterState.setServiceState(nodeId, NodeServiceState.SYNCING);
+                    log.info("Node {} transitioned OFFLINE → SYNCING (health recovered)", nodeId);
+                }
             } else if (current == NodeServiceState.ONLINE) {
                 // Don't trigger an ONLINE→SYNCING churn based on a stale primary checkpoint
                 // (e.g. primary CDC briefly paused or restarted). Only act on fresh lag.

@@ -56,7 +56,8 @@ require_cmd python3
 [[ -n "${ADMIN_TOKEN}" ]] || die "ADMIN_TOKEN is required"
 
 get_cluster_status() {
-  curl -fsS "${AGENT_URL}/cluster/status"
+  # See ha-smoke-test-3node.sh: /cluster/* requires auth; reads were missing it.
+  curl -fsS -H "Authorization: Bearer ${ADMIN_TOKEN}" "${AGENT_URL}/cluster/status"
 }
 
 json_get_primary_node() {
