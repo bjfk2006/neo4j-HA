@@ -43,7 +43,10 @@ public class RelationshipApplier {
         // when the CDC event lacks endpoint ids (pre-BUG-082 transit
         // nodes written by the old REL_DELETE_TRIGGER during rolling
         // upgrade).
-        if (startNodeId != null && endNodeId != null) {
+        // BUG-089: 判据从 `!= null` 收紧为 "非空白"。触发器在拿不到端点 id 时
+        // 本就不写该属性（null），但历史事件里可能存在空串；空串走 scoped 分支会
+        // 匹配不到任何关系，删除被静默丢弃 —— 那比精度降级严重得多。
+        if (isPresent(startNodeId) && isPresent(endNodeId)) {
             String cypher = CypherTemplates.REL_DELETE_SCOPED.formatted(safeType);
             tx.run(cypher, Map.of(
                 "startNodeId", startNodeId,
@@ -126,5 +129,9 @@ public class RelationshipApplier {
         return labels.stream()
             .map(IndexManager::sanitizeLabel)
             .collect(Collectors.joining(":"));
+    }
+
+    private static boolean isPresent(String eid) {
+        return eid != null && !eid.isBlank();
     }
 }

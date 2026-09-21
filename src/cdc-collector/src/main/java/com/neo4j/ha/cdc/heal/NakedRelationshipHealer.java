@@ -140,10 +140,12 @@ public class NakedRelationshipHealer {
         WITH r, a, b
         ORDER BY r.createdAt ASC
         LIMIT $batchSize
-        WITH r, elementId(r) AS eid, r.createdAt AS origCreated
+        WITH r, a, b, elementId(r) AS eid, r.createdAt AS origCreated
         SET r._elementId  = eid,
             r._created_at = coalesce(r._created_at, origCreated, timestamp()),
-            r._updated_at = timestamp()
+            r._updated_at = timestamp(),
+            r._startElementId = coalesce(r._startElementId, a._elementId, elementId(a)),
+            r._endElementId   = coalesce(r._endElementId,   b._elementId, elementId(b))
         RETURN origCreated AS maxCreatedAt
         """;
 
@@ -161,10 +163,12 @@ public class NakedRelationshipHealer {
         WITH r, a, b
         ORDER BY elementId(r) ASC
         LIMIT $batchSize
-        WITH r, elementId(r) AS eid
+        WITH r, a, b, elementId(r) AS eid
         SET r._elementId  = eid,
             r._created_at = coalesce(r._created_at, r.createdAt, timestamp()),
-            r._updated_at = timestamp()
+            r._updated_at = timestamp(),
+            r._startElementId = coalesce(r._startElementId, a._elementId, elementId(a)),
+            r._endElementId   = coalesce(r._endElementId,   b._elementId, elementId(b))
         RETURN eid AS maxEid
         """;
 

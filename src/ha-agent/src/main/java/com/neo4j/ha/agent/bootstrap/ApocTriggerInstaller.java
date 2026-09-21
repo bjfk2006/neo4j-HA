@@ -249,13 +249,24 @@ public class ApocTriggerInstaller {
     // NakedRelationshipHealer (BUG-062) already repairs `_elementId` /
     // `_updated_at` on the same schedule and can be extended to stamp
     // `_type` if this edge case is observed in production.
-    private static final String REL_TIMESTAMP_TRIGGER = """
+    // BUG-089 (2026-09-21): 同时 stamp 端点身份 `_startElementId` / `_endElementId`。
+    // 删除触发器（REL_DELETE_TRIGGER，phase:'before'）过去直接读 `startNode(dr)._elementId`，
+    // 在 DETACH DELETE 下端点已被同 tx 标删、属性读必抛 EntityNotFoundException。
+    // 这里是 afterAsync、关系刚创建、端点都活着，读属性安全；stamp 之后删除侧只需从
+    // `$removedRelationshipProperties` 取旧值，不再触碰任何节点代理。
+    // 与 `_type` 同样有一个亚秒窗口：提交到 stamp 之间被删的关系拿不到端点 id，
+    // 此时 REL_DELETED 的 startElementId/endElementId 为空串，applier 回落 legacy 路径。
+    static final String REL_TIMESTAMP_TRIGGER = """
         CALL apoc.trigger.install($db, 'cdc-rel-timestamp',
           'UNWIND $createdRelationships AS r
            SET r._created_at = coalesce(r._created_at, timestamp())
            SET r._updated_at = coalesce(r._updated_at, timestamp())
            SET r._elementId = coalesce(r._elementId, elementId(r))
-           SET r._type      = coalesce(r._type, type(r))',
+           SET r._type      = coalesce(r._type, type(r))
+           SET r._startElementId = coalesce(r._startElementId,
+                 coalesce(startNode(r)._elementId, elementId(startNode(r))))
+           SET r._endElementId   = coalesce(r._endElementId,
+                 coalesce(endNode(r)._elementId, elementId(endNode(r))))',
           {phase: 'afterAsync'})
         """;
 
@@ -552,25 +563,43 @@ public class ApocTriggerInstaller {
     // can silently delete a completely unrelated later rel that happens to
     // inherit the recycled id. See CypherTemplates.REL_DELETE_SCOPED.
     //
-    // 'before' phase: `dr` is still a live reference inside the commit-
-    // pending tx, and startNode/endNode of `dr` are still resolvable (even
-    // in DETACH DELETE where the endpoint nodes themselves are being
-    // deleted — they're not yet committed). We prefer the endpoint's
-    // `_elementId` property (stable app-level id) and only fall back to
-    // `elementId()` (internal id) when the property is absent.
-    private static final String REL_DELETE_TRIGGER = """
+    // BUG-089 (2026-09-21): BUG-082 的写法
+    //   `coalesce(sn._elementId, elementId(sn))`（sn = startNode(dr)）
+    // 在 `DETACH DELETE n` 下会抛
+    //   `EntityNotFoundException: Node with id N has been deleted in this transaction`
+    //   （栈底 ExceptionTranslatingReadOperations.getProperty）
+    // —— 端点节点已在同一 tx 内被标记删除，**读它的属性**会撞上 kernel 的
+    // "本 tx 已删"防御检查。原注释断言"startNode/endNode 仍可解析"，这只对
+    // **拿到代理对象**成立，对**读代理的属性**不成立。
+    //
+    // 生产证据（香港测试环境 10.55.77.3）：该 WARN 自 2026-07-20 起累计 5745 次，
+    // 且按 phase:'before' 的语义（任一 trigger 抛异常 → 整 tx terminate，见
+    // ha-agent-design.md BUG-065 一节）**业务删除事务本身一起失败**；REL_DELETED
+    // 事件从未生成，standby 上留下裸关系，靠 NakedRelationshipHealer 每轮固定修
+    // 500 条静默兜底（lifetime 单调增长）。
+    //
+    // 修法与 BUG-066 处理 `type(dr)` 同一路数：把端点身份在**创建时**
+    // （REL_TIMESTAMP_TRIGGER，afterAsync，端点都活着）stamp 成关系自己的属性，
+    // 删除时只从 `$removedRelationshipProperties` 读旧值，**一次节点代理都不碰**。
+    // 老关系（fix 之前创建、没有这两个属性）拿不到端点 id 时该字段直接缺省（Cypher
+    // 里给属性赋 null = 不写这个属性），DeleteEventCapture 读出 null，
+    // RelationshipApplier 回落 BUG-082 保留的 legacy REL_DELETE 路径——宁可精度
+    // 降级，也不能再让业务事务失败。**不要写空串**：applier 的分支判据是
+    // `!= null`，空串会被当成有效端点，scoped 删除匹配不到任何关系、删除静默丢失。
+    static final String REL_DELETE_TRIGGER = """
         CALL apoc.trigger.install($db, 'cdc-capture-rel-deletes',
           'UNWIND coalesce($removedRelationshipProperties["_type"], []) AS typeEntry
            WITH typeEntry.relationship AS dr,
                 typeEntry.old          AS drType
            WHERE coalesce(drType, "") <> "_PROBE_REL"
-           WITH dr, drType, elementId(dr) AS drLocalEid,
-                startNode(dr) AS sn, endNode(dr) AS en
+           WITH dr, drType, elementId(dr) AS drLocalEid
            WITH drType, drLocalEid,
-                coalesce(sn._elementId, elementId(sn)) AS drStartEid,
-                coalesce(en._elementId, elementId(en)) AS drEndEid,
                 head([e IN coalesce($removedRelationshipProperties["_elementId"], [])
-                      WHERE elementId(e.relationship) = drLocalEid | e.old]) AS drEidProp
+                      WHERE elementId(e.relationship) = drLocalEid | e.old]) AS drEidProp,
+                head([e IN coalesce($removedRelationshipProperties["_startElementId"], [])
+                      WHERE elementId(e.relationship) = drLocalEid | e.old]) AS drStartEid,
+                head([e IN coalesce($removedRelationshipProperties["_endElementId"], [])
+                      WHERE elementId(e.relationship) = drLocalEid | e.old]) AS drEndEid
            CREATE (:_CDCDeleteEvent {
              eventType: "REL_DELETED",
              elementId: coalesce(drEidProp, drLocalEid),
